@@ -418,6 +418,8 @@ mod heralds_horn_changeling_chosen_type;
 mod heroic_defiance_recipient_color_4590;
 mod heroic_return_enters_this_way;
 mod heroic_sacrifice_redirect;
+mod hidden_agenda_pregame;
+mod hidden_agenda_effects;
 mod hit_the_mother_lode;
 mod hogaak_cant_spend_mana_1095;
 mod hollow_one_cost_reduction;

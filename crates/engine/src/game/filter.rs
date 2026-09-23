@@ -4926,11 +4926,11 @@ fn filter_inner_for_object(
                 recipient_id,
                 triggering_object,
             );
-            let chosen_name = source_ctx.chosen_attributes.iter().find_map(|a| match a {
-                ChosenAttribute::CardName(n) => Some(n.as_str()),
-                _ => None,
-            });
-            chosen_name.is_some_and(|name| obj.name.eq_ignore_ascii_case(name))
+            // CR 702.106f + CR 607.2d: a linked name can be any of the
+            // names chosen for this source (double agenda chooses two).
+            source_ctx.chosen_attributes.iter().any(|choice| {
+                matches!(choice, ChosenAttribute::CardName(name) if obj.name.eq_ignore_ascii_case(name))
+            })
         }
         // CR 609.7a: "the chosen source" — match the ObjectId selected by
         // the prior damage-source choice while its continuation resolves.
@@ -5186,11 +5186,11 @@ fn zone_change_filter_inner(
                 None,
                 triggering_object,
             );
-            let chosen_name = source_ctx.chosen_attributes.iter().find_map(|a| match a {
-                    ChosenAttribute::CardName(n) => Some(n.as_str()),
-                    _ => None,
-            });
-            chosen_name.is_some_and(|name| record.name.eq_ignore_ascii_case(name))
+            // CR 702.106f + CR 607.2d: keep the snapshot path aligned with
+            // live-object matching for every name chosen for this source.
+            source_ctx.chosen_attributes.iter().any(|choice| {
+                matches!(choice, ChosenAttribute::CardName(name) if record.name.eq_ignore_ascii_case(name))
+            })
         }
         // CR 607.2d + CR 603.10a + CR 400.7: the remembered object on the
         // leaves-the-battlefield look-back path. The candidate occurrence is the
@@ -5750,6 +5750,7 @@ pub fn spell_object_matches_filter_from_state_for(
             state,
             source_id,
             source_controller: source_obj.controller,
+            caster,
             // CR 109.1 is cited as the identity foundation here (an object
             // is uniquely the object that it is) because the Comprehensive
             // Rules have no dedicated entry defining "another" — the
@@ -5791,6 +5792,13 @@ struct SpellFilterContext<'a> {
     state: &'a GameState,
     source_id: ObjectId,
     source_controller: PlayerId,
+    /// CR 608.2c + CR 109.4: the player casting the spell being filtered. A
+    /// `CantBeCast` filter may carry a dynamic bound scoped to the *affected*
+    /// player ("mana value greater than the number of lands that player
+    /// controls" — Lavinia, Azorius Renegade). `source_controller` is the
+    /// static ability's controller, which is the wrong player for those bounds;
+    /// the caster is the one the restriction is evaluated against.
+    caster: PlayerId,
     /// CR 109.1 (cited as identity foundation — CR has no dedicated
     /// "another" entry): ObjectId of the spell being filtered. `None` when
     /// the caller reaches this helper matching a historical `SpellCastRecord`
@@ -5959,12 +5967,7 @@ fn spell_object_matches_property(
                     let Some(context) = context else {
                         return false;
                     };
-                    resolve_quantity(
-                        context.state,
-                        value,
-                        context.source_controller,
-                        context.source_id,
-                    )
+                    resolve_quantity(context.state, value, context.caster, context.source_id)
                 }
             };
             comparator.evaluate(record.mana_value as i32, threshold)

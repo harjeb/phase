@@ -3559,6 +3559,45 @@ mod tests {
         assert!(mgr.reconnect.is_disconnected(&other_code, PlayerId(0)));
     }
 
+    #[cfg(feature = "manabrew")]
+    #[test]
+    fn manabrew_tokens_and_prompts_are_seat_bound() {
+        use manabrew_compat::{ClientToServerMessage, MulliganOutput, PromptOutput};
+        let mut mgr = SessionManager::new();
+        let (code, first) = mgr.create_game(make_deck(), None);
+        let (second, _) = join_game(&mut mgr, &code, make_deck(), None).unwrap();
+        let cards = |_: &engine::game::game_object::GameObject| Some(String::new());
+        let mut session = mgr.try_session(&code).unwrap();
+        assert!(session.manabrew_snapshot(&first, &cards).is_err());
+        session.start_game(&lands_db()).unwrap();
+        assert!(session.manabrew_snapshot("unknown-token", &cards).is_err());
+        let a = session.manabrew_snapshot(&first, &cards).unwrap();
+        let b = session.manabrew_snapshot(&second, &cards).unwrap();
+        assert_eq!(a.your_player, PlayerId(0));
+        assert_eq!(b.your_player, PlayerId(1));
+        for (snapshot, owner) in [(&a, "player-0"), (&b, "player-1")] {
+            let wire = serde_json::to_value(&snapshot.update).unwrap();
+            for hand in wire["gameView"]["zones"].as_array().unwrap().iter()
+                .filter(|zone| zone["zone"] == "hand") {
+                assert_eq!(hand["count"], 7);
+                assert_eq!(hand["cards"].as_array().unwrap().len(), if hand["ownerId"] == owner { 7 } else { 0 });
+            }
+        }
+        let a_prompt = a.prompt.as_ref().unwrap().prompt_id;
+        let b_prompt = b.prompt.as_ref().unwrap().prompt_id;
+        assert_ne!(a_prompt, b_prompt);
+        let response = |prompt_id| ClientToServerMessage::Response {
+            prompt_id,
+            action: PromptOutput::Mulligan(MulliganOutput::MulliganDecision { keep: true }),
+        };
+        assert!(session.translate_manabrew_message(&second, response(a_prompt)).is_err());
+        session.handle_manabrew_message(&first, response(a_prompt)).unwrap();
+        assert!(session.handle_manabrew_message(&first, response(a_prompt)).is_err());
+        assert!(session.handle_manabrew_message(&second, response(b_prompt)).is_err());
+        let current = session.manabrew_snapshot(&second, &cards).unwrap();
+        session.handle_manabrew_message(&second, response(current.prompt.unwrap().prompt_id)).unwrap();
+    }
+
     #[test]
     fn remove_nonexistent_game_reports_no_entry() {
         let mut mgr = SessionManager::new();

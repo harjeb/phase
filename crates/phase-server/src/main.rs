@@ -537,6 +537,22 @@ fn build_game_started_message(
     }
 }
 
+#[cfg(test)]
+#[test]
+fn started_fanout_delivers_only_each_seats_own_reconnect_token() {
+    let mut manager = SessionManager::new();
+    let (code, host_token) = manager.create_game(Default::default(), None);
+    let mut session = manager.try_session(&code).unwrap();
+    session.player_tokens[1] = "guest-token".into();
+    let messages = build_game_started_messages(&mut session);
+    assert_eq!(messages.len(), 2);
+    for (seat, message) in messages {
+        let ServerMessage::GameStarted { player_token, your_player, .. } = message else { panic!("expected start"); };
+        assert_eq!(your_player, seat);
+        assert_eq!(player_token.as_deref(), Some(if seat == PlayerId(0) { host_token.as_str() } else { "guest-token" }));
+    }
+}
+
 /// Initial post-start fan-out. DRAINS `session.start_events` so the first-player
 /// contest is sent exactly once — every subsequent `GameStarted` build
 /// (late joiners, reconnects) sees an empty batch and never re-shows the
@@ -549,7 +565,12 @@ fn build_game_started_messages(session: &mut GameSession) -> Vec<(PlayerId, Serv
         .map(|player| {
             (
                 player,
-                build_game_started_message(session, player, None, start_events.clone()),
+                build_game_started_message(
+                    session,
+                    player,
+                    session.player_tokens.get(player.0 as usize).cloned().filter(|token| !token.is_empty()),
+                    start_events.clone(),
+                ),
             )
         })
         .collect()
@@ -1183,6 +1204,11 @@ fn reject_if_disabled(msg: &ClientMessage, mode: ServerMode) -> Option<&'static 
     const FULL_MODE_REJECTION: &str = "UnregisterLobby is only valid on lobby-only servers";
 
     match msg {
+        #[cfg(feature = "manabrew")]
+        ClientMessage::ManabrewSnapshot | ClientMessage::ManabrewResponse { .. } => match mode {
+            ServerMode::Full => None,
+            ServerMode::LobbyOnly => Some(LOBBY_ONLY_REJECTION),
+        },
         // Always allowed — handshake, lobby subscription, ping.
         ClientMessage::ClientHello { .. }
         | ClientMessage::SubscribeLobby
@@ -1418,6 +1444,10 @@ enum FullSocketAuthority {
 
 fn full_socket_authority(message: &ClientMessage) -> FullSocketAuthority {
     match message {
+        #[cfg(feature = "manabrew")]
+        ClientMessage::ManabrewSnapshot | ClientMessage::ManabrewResponse { .. } => {
+            FullSocketAuthority::CurrentSeat
+        }
         ClientMessage::ClientHello { .. }
         | ClientMessage::SubscribeLobby
         | ClientMessage::UnsubscribeLobby
@@ -2317,7 +2347,16 @@ async fn serve() {
     let connections: SharedConnections = Arc::new(Mutex::new(HashMap::new()));
     let draft_spectators: SharedDraftSpectators = Arc::new(Mutex::new(HashMap::new()));
     let game_spectators: SharedGameSpectators = Arc::new(Mutex::new(HashMap::new()));
-    let lobby: SharedLobby = Arc::new(Mutex::new(Broker::new()));
+    let mut broker = Broker::new();
+    let mut tournaments = game_db
+        .load_tournaments()
+        .expect("Failed to restore native tournament authority");
+    tournaments.check_expired(&SysEnv);
+    game_db
+        .save_tournaments(&tournaments)
+        .expect("Failed to persist restored native tournament authority");
+    *broker.tournaments_mut() = tournaments;
+    let lobby: SharedLobby = Arc::new(Mutex::new(broker));
     let lobby_subscribers: SharedLobbySubscribers = Arc::new(Mutex::new(Vec::new()));
     let player_count: SharedPlayerCount = Arc::new(AtomicU32::new(0));
 
@@ -2645,7 +2684,16 @@ async fn serve() {
             // and has no shell-side decline to wait for.
             let reaped = {
                 let mut broker = bg_lobby.lock().await;
-                broker.reap_expired_handled(&handled_lobby, &SysEnv)
+                let previous = broker.tournaments().clone();
+                let mut reaped = broker.reap_expired_handled(&handled_lobby, &SysEnv);
+                if !reaped.tournament.is_empty() {
+                    if let Err(error) = bg_game_db.save_tournaments(broker.tournaments()) {
+                        *broker.tournaments_mut() = previous;
+                        reaped.tournament.clear();
+                        warn!(%error, "tournament expiry persistence failed; retrying next sweep");
+                    }
+                }
+                reaped
             };
             // Every disjunct is load-bearing, because each names work this tick
             // did that no other disjunct witnesses: a tick that deferred every
@@ -4369,6 +4417,7 @@ async fn handle_socket(
     // the client route host/join flows through WS (Full) or P2P+broker
     // (LobbyOnly) without probing.
     let hello = ServerMessage::ServerHello {
+        manabrew_version: (cfg!(feature = "manabrew") && matches!(mode, ServerMode::Full)).then_some(2),
         server_version: env!("CARGO_PKG_VERSION").to_string(),
         build_commit: build_commit().to_string(),
         protocol_version: PROTOCOL_VERSION,
@@ -4666,6 +4715,7 @@ fn to_server_message(m: lobby_broker::LobbyServerMessage) -> ServerMessage {
             mode,
             lobby_protocol_version,
         } => ServerMessage::ServerHello {
+            manabrew_version: None,
             server_version,
             build_commit,
             protocol_version,
@@ -5047,6 +5097,34 @@ async fn dispatch_broker_msg(
     };
     identity.absorb_conn_state(conn);
     apply_outbounds(outbounds, tx, lobby_subscribers, player_count).await;
+}
+
+#[cfg(test)]
+mod tournament_persistence_tests;
+
+/// Commit the broker authority before any success or credential is published.
+/// The caller holds the lobby mutex, so a failed write can roll back without
+/// discarding another socket's action.
+fn handle_durable_tournament(
+    broker: &mut Broker,
+    conn: &mut ConnState,
+    message: lobby_broker::LobbyClientMessage,
+    game_db: &persistence::GameDb,
+) -> Result<Vec<Outbound>, String> {
+    if matches!(&message, lobby_broker::LobbyClientMessage::GetTournament { .. }) {
+        return Ok(broker.handle(conn, message, &SysEnv));
+    }
+    let previous = broker.tournaments().clone();
+    let previous_conn = conn.clone();
+    let outbounds = broker.handle(conn, message, &SysEnv);
+    // ponytail: one serialized registry under the lobby lock; use per-event
+    // transactions if tournament write volume makes this lock material.
+    if let Err(error) = game_db.save_tournaments(broker.tournaments()) {
+        *broker.tournaments_mut() = previous;
+        *conn = previous_conn;
+        return Err(format!("Failed to persist tournament action: {error}"));
+    }
+    Ok(outbounds)
 }
 
 /// Interpret an ordered `Vec<Outbound>` from the broker over the shell's
@@ -6023,8 +6101,21 @@ async fn report_draft_game_over(
         };
         let match_id = match_id.clone();
 
-        // Map PlayerId winner to seat index
-        let winner_seat = winner.map(|pid| pid.0);
+        // Full seats are positions within this pairing, not draft pod seats.
+        let Some(pairing) = session.session.pairings.iter().find(|p| p.match_id == match_id) else {
+            warn!(draft = %draft_code, %match_id, "missing pairing for draft result");
+            return;
+        };
+        let winner_seat = match winner {
+            Some(player) => match pairing.players.get(usize::from(player.0)) {
+                Some(seat) => Some(seat.0),
+                None => {
+                    warn!(draft = %draft_code, %match_id, "invalid Full winner for draft pairing");
+                    return;
+                }
+            },
+            None => None,
+        };
 
         (match_id, winner_seat)
     };
@@ -6445,6 +6536,7 @@ impl DeckResolver for ServerDeckResolver<'_> {
         server_core::resolve_deck(self.db, &deck)?;
         Ok(engine::game::deck_loading::PlayerDeckList {
             main_deck: deck.main_deck,
+            conspiracy: Vec::new(),
             sideboard: deck.sideboard,
             commander: deck.commander,
             companion: deck.companion,
@@ -6894,6 +6986,11 @@ async fn broadcast_takeback_approved(
 /// not give the payload-guard match below a total, wildcard-free form.
 #[derive(Debug)]
 enum GameSubmission {
+    #[cfg(feature = "manabrew")]
+    Manabrew {
+        message: server_core::manabrew::ClientToServerMessage,
+        request_id: Option<u32>,
+    },
     Action(GameAction),
     Interaction(InteractionSubmission),
 }
@@ -6915,6 +7012,10 @@ fn session_action_error_message(error: SessionActionError) -> ServerMessage {
 /// boundary.
 fn operation_failed_message(msg: &ClientMessage, message: String) -> Option<ServerMessage> {
     match msg {
+        #[cfg(feature = "manabrew")]
+        ClientMessage::ManabrewSnapshot | ClientMessage::ManabrewResponse { .. } => {
+            Some(ServerMessage::ActionFailed { message })
+        }
         ClientMessage::Action { .. }
         | ClientMessage::Interaction { .. }
         | ClientMessage::Concede => Some(ServerMessage::ActionFailed { message }),
@@ -7009,6 +7110,8 @@ impl GameSubmission {
     /// call sites from restating the variant set.
     fn kind(&self) -> &'static str {
         match self {
+            #[cfg(feature = "manabrew")]
+            GameSubmission::Manabrew { .. } => "manabrew",
             GameSubmission::Action(_) => "action",
             GameSubmission::Interaction(_) => "interaction",
         }
@@ -7027,6 +7130,9 @@ impl GameSubmission {
 
     fn payload_rejection(&self) -> Result<(), Box<ServerMessage>> {
         match self {
+            #[cfg(feature = "manabrew")]
+            GameSubmission::Manabrew { message, .. } => server_core::manabrew::guard_message(message)
+                .map_err(|message| Box::new(ServerMessage::ActionFailed { message })),
             GameSubmission::Action(action) => {
                 guard_game_action_payload(action).map_err(|_reason| {
                     Box::new(ServerMessage::ActionRejected {
@@ -7211,7 +7317,23 @@ async fn handle_full_game_submission(
             return;
         }
         let mut session = session.expect("the gate above proved the session is present");
+        #[cfg(feature = "manabrew")]
+        let manabrew_request_id = match &submission {
+            GameSubmission::Manabrew { request_id, .. } => *request_id,
+            _ => None,
+        };
         let applied = match submission {
+            #[cfg(feature = "manabrew")]
+            GameSubmission::Manabrew { message, .. } => session
+                .translate_manabrew_message(&player_token, message)
+                .map_err(server_core::manabrew::ManabrewError::into_session_error)
+                .and_then(|action| {
+                    session.handle_action_with_card_db_outcome(
+                        &player_token,
+                        action,
+                        Some(db.as_ref()),
+                    )
+                }),
             GameSubmission::Action(action) => {
                 session.handle_action_with_card_db_outcome(&player_token, action, Some(db.as_ref()))
             }
@@ -7227,6 +7349,13 @@ async fn handle_full_game_submission(
                     return;
                 }
                 let human_revision = session.advance_state_revision();
+                #[cfg(feature = "manabrew")]
+                if let Some(request_id) = manabrew_request_id {
+                    let _ = tx.send(ServerMessage::ManabrewResponseAccepted {
+                        request_id,
+                        state_revision: human_revision,
+                    });
+                }
                 // Run AI follow-up actions (still inside this game's lock —
                 // needs &mut state)
                 let ai_outcome = session.run_ai();
@@ -7251,6 +7380,22 @@ async fn handle_full_game_submission(
                     engine::types::game_state::WaitingFor::GameOver { winner } => Some(*winner),
                     _ => None,
                 };
+                #[cfg(feature = "manabrew")]
+                let manabrew_terminal: Vec<_> = if game_over_winner.is_some() {
+                    (0..session.player_count).map(PlayerId)
+                    .filter(|player| !session.ai_seats.contains(player)).filter_map(|player| {
+                        let token = &session.player_tokens[player.0 as usize];
+                        match session.manabrew_snapshot(token, db.as_ref()) {
+                            Ok(snapshot) => Some((player, ServerMessage::ManabrewSnapshot { snapshot: Box::new(snapshot) })),
+                            Err(error) => {
+                                warn!(?player, ?error, "terminal ManaBrew projection failed");
+                                None
+                            }
+                        }
+                    }).collect()
+                } else { Vec::new() };
+                #[cfg(not(feature = "manabrew"))]
+                let manabrew_terminal: Vec<(PlayerId, ServerMessage)> = Vec::new();
                 let terminal = if let Some(winner) = game_over_winner {
                     info!(game = %game_code, winner = ?winner, reason = "game_rules", "game over");
                     let ranked_result = ranked_duel_players(session).and_then(|players| {
@@ -7286,6 +7431,7 @@ async fn handle_full_game_submission(
                             rewind_targets,
                             ai_failure,
                             full_key,
+                            manabrew_terminal,
                         )
                     })
             }
@@ -7313,6 +7459,7 @@ async fn handle_full_game_submission(
             rewind_targets,
             ai_failure,
             full_key,
+            manabrew_terminal,
         )) => {
             if let Err(reason) = guard_state_snapshot_broadcast(StateSnapshotParts {
                 state: &raw_state,
@@ -7462,6 +7609,19 @@ async fn handle_full_game_submission(
             .await;
 
             broadcast_ai_failure(connections, &game_code, ai_failure).await;
+
+            // A snapshot request after the terminal StateUpdate arrives too late:
+            // deliver each seat's final private board before retiring the session.
+            if !manabrew_terminal.is_empty() {
+                let conns = connections.lock().await;
+                if let Some(players) = conns.get(&game_code) {
+                    for (player, snapshot) in manabrew_terminal {
+                        if let Some(sender) = players.get(&player) {
+                            let _ = sender.send(snapshot);
+                        }
+                    }
+                }
+            }
 
             if !terminal_deliveries.is_empty() {
                 let conns = connections.lock().await;
@@ -7920,6 +8080,59 @@ async fn handle_client_message(
     }
 
     match client_msg {
+        #[cfg(feature = "manabrew")]
+        ClientMessage::ManabrewSnapshot => {
+            // Recheck socket generation under the same session lock used for
+            // projection, just like action submission. Never use a wire viewer.
+            let response = match (&identity.game_code, &identity.player_token) {
+                (Some(code), Some(token)) => match lock_session(state, code).await {
+                    Ok(session) => {
+                        if full_socket_is_current_while_state_locked(
+                            &session,
+                            connections,
+                            identity,
+                            tx,
+                        )
+                        .await
+                        {
+                            match session.manabrew_snapshot(token, db.as_ref()) {
+                                Ok(snapshot) => ServerMessage::ManabrewSnapshot {
+                                    snapshot: Box::new(snapshot),
+                                },
+                                Err(error) => {
+                                    session_action_error_message(error.into_session_error())
+                                }
+                            }
+                        } else {
+                            ServerMessage::ActionFailed {
+                                message: FULL_SOCKET_AUTHORITY_REJECTION.into(),
+                            }
+                        }
+                    }
+                    Err(message) => ServerMessage::ActionFailed { message },
+                },
+                _ => ServerMessage::ActionFailed {
+                    message: "Not in a game".into(),
+                },
+            };
+            let _ = tx.send(response);
+        }
+        #[cfg(feature = "manabrew")]
+        ClientMessage::ManabrewResponse { message, request_id } => {
+            handle_full_game_submission(
+                GameSubmission::Manabrew { message, request_id },
+                socket,
+                state,
+                db,
+                draft_state,
+                connections,
+                tx,
+                game_db,
+                game_spectators,
+                identity,
+            )
+            .await;
+        }
         ClientMessage::ClientHello { .. } => {
             // Unreachable: IgnoreRedundantHello above handled this case.
             debug!("unreachable ClientHello arm");
@@ -11220,6 +11433,7 @@ async fn handle_client_message(
             if let Ok(json) = serde_json::to_string(&msg) {
                 let _ = socket.send(Message::text(json)).await;
             }
+            broadcast_draft_views(&draft_code, connections, draft_state).await;
 
             if public {
                 let game = {
@@ -11298,7 +11512,7 @@ async fn handle_client_message(
                     }
 
                     let msg = ServerMessage::DraftJoined {
-                        draft_code,
+                        draft_code: draft_code.clone(),
                         player_token,
                         seat_index,
                         view,
@@ -11306,6 +11520,7 @@ async fn handle_client_message(
                     if let Ok(json) = serde_json::to_string(&msg) {
                         let _ = socket.send(Message::text(json)).await;
                     }
+                    broadcast_draft_views(&draft_code, connections, draft_state).await;
                 }
                 Err(reason) => {
                     if reason == "password_required" {
@@ -11682,15 +11897,34 @@ async fn handle_client_message(
         | ClientMessage::DropFromTournament { .. }
         | ClientMessage::EndTournament { .. }
         | ClientMessage::RenewTournamentCredential { .. } => {
-            dispatch_broker(
-                &client_msg,
-                lobby,
-                lobby_subscribers,
-                player_count,
-                tx,
-                identity,
-            )
-            .await;
+            let mut conn = identity.to_conn_state();
+            let outbounds = {
+                let mut broker = lobby.lock().await;
+                handle_durable_tournament(
+                    &mut broker,
+                    &mut conn,
+                    to_lobby_client_message(&client_msg).expect("tournament projection"),
+                    game_db,
+                )
+            };
+            match outbounds {
+                Ok(outbounds) => {
+                    identity.absorb_conn_state(conn);
+                    apply_outbounds(outbounds, tx, lobby_subscribers, player_count).await;
+                }
+                Err(reason) => {
+                    let request_id = to_lobby_client_message(&client_msg)
+                        .and_then(|message| message.tournament_request_id());
+                    let message = match request_id {
+                        Some(request_id) => ServerMessage::TournamentActionRejected {
+                            request_id,
+                            message: reason,
+                        },
+                        None => ServerMessage::error(reason),
+                    };
+                    let _ = tx.send(message);
+                }
+            }
         }
     }
 }
@@ -13146,6 +13380,32 @@ mod draft_socket_authority_tests {
             draft_code,
             player_token,
         )
+    }
+
+    #[tokio::test]
+    async fn draft_result_maps_full_winner_through_pairing_order() {
+        let (drafts, connections, code, _) = test_draft();
+        {
+            let mut manager = drafts.lock().await;
+            let draft = manager.sessions.get_mut(&code).unwrap();
+            draft.session.status = DraftStatus::MatchInProgress;
+            draft.session.current_round = 1;
+            draft.session.pairings.push(DraftPairing {
+                round: 1, table: 0, players: [PlayerId(6), PlayerId(2)],
+                match_id: "r1-t0".to_string(), status: PairingStatus::Pending, winner: None,
+            });
+            draft.active_matches.insert("r1-t0".to_string(), "MATCH1".to_string());
+        }
+        report_draft_game_over(&drafts, &connections, "MATCH1", Some(PlayerId(1))).await;
+        {
+            let manager = drafts.lock().await;
+            let pairing = &manager.sessions[&code].session.pairings[0];
+            assert_eq!(pairing.winner, Some(PlayerId(2)));
+            assert_eq!(pairing.status, PairingStatus::Complete);
+        }
+        // A malformed Full winner must not replace a previously recorded result.
+        report_draft_game_over(&drafts, &connections, "MATCH1", Some(PlayerId(6))).await;
+        assert_eq!(drafts.lock().await.sessions[&code].session.pairings[0].winner, Some(PlayerId(2)));
     }
 
     fn draft_admission_messages(draft_code: &str) -> [ClientMessage; 2] {

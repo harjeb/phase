@@ -8729,7 +8729,7 @@ fn parse_oracle_pipeline(
     let mut parsed = lower_oracle_ir(&mut ir);
     let mut raw_lowered = capture_stages.then(|| parsed.clone());
     render_granting_self_descriptions(&mut parsed, card_name);
-    demote_unbound_delayed_sweeps(&mut parsed);
+    bind_unbound_delayed_sweeps(&mut parsed);
     demote_unenforceable_replacement_lifetimes(&mut parsed);
     #[cfg(debug_assertions)]
     crate::parser::oracle_effect::debug_assert_exile_top_opponent_sentinel_lifted(
@@ -9423,54 +9423,90 @@ fn demote_lifetimes_in_modification(modification: &mut ContinuousModification) {
     }
 }
 
-/// CR 603.7a + CR 603.7c + CR 400.7: Post-lowering coverage-honesty net for the
+/// CR 603.7a + CR 603.7c + CR 400.7: Post-lowering binding net for the
 /// impulse-cleanup **sweep** — a delayed graveyard move whose swept objects were
-/// never bound to a concrete set.
+/// parsed as an unbound anaphor (`ParentTarget`/`Any`) instead of a concrete set.
 ///
-/// `oracle_effect::delayed_sweep_is_unbound_anaphor` documents the shape and why
-/// it cannot work: the zone change is left targeting `ParentTarget`, which
-/// resolves to the parent instruction's chosen target (for Grinning Totem the
-/// targeted *opponent*, not the exiled card), so the swept card is stranded in
-/// its zone while the card reports as fully supported.
+/// `oracle_effect::delayed_sweep_is_unbound_anaphor` identifies the shape:
+/// "At the beginning of the next end step, if any of those cards remain exiled,
+/// put them into your graveyard" (Glimpse the Impossible, Bank Job, Three
+/// Wishes, Grinning Totem). The swept objects are the cards a preceding clause in
+/// the SAME ability exiled, which the chain publishes as a tracked set.
+///
+/// This pass rewrites the sweep's target to the whole tracked set (`Any`) and
+/// marks the delayed trigger tracked-set-consuming (`uses_tracked_set = true`),
+/// so `game::effects::delayed_trigger::resolve` binds it to the published exile
+/// set at INSTALLATION time — while the chain's tracked set is still live — via
+/// `bind_tracked_set_to_effect`. The `Any` (whole-set) form is load-bearing:
+/// leaving `ParentTarget` makes the binder build
+/// `TrackedSetFiltered { filter: ParentTarget }`, which matches nothing when the
+/// parent is a player referent (Grinning Totem's targeted opponent).
 ///
 /// This runs as a post-lowering invariant rather than inside one grammar arm on
-/// purpose: several builders can emit a `CreateDelayedTrigger`, and the honesty
+/// purpose: several builders can emit a `CreateDelayedTrigger`, and the binding
 /// requirement is a property of the FINAL tree, not of any single production. It
 /// sits beside `render_granting_self_descriptions` for the same reason —
-/// that pass is the existing precedent for a whole-tree degrade net.
-fn demote_unbound_delayed_sweeps(parsed: &mut ParsedAbilities) {
+/// that pass is the existing precedent for a whole-tree net.
+fn bind_unbound_delayed_sweeps(parsed: &mut ParsedAbilities) {
     for def in &mut parsed.abilities {
-        demote_sweeps_in_ability(def);
+        bind_unbound_sweeps_in_ability(def);
     }
     for trig in &mut parsed.triggers {
         if let Some(exec) = trig.execute.as_deref_mut() {
-            demote_sweeps_in_ability(exec);
+            bind_unbound_sweeps_in_ability(exec);
         }
     }
 }
 
-/// Walk one ability chain, replacing any `CreateDelayedTrigger` whose inner
-/// chain is an unbound graveyard sweep with an honest `Effect::unimplemented`.
-/// The gap key is a stable snake_case pattern-class key (CLAUDE.md), distinct
-/// from every previously-supported handler so the resulting coverage flip lands
-/// in `coverage-regression-check.sh`'s non-fatal "coverage honesty" bucket.
-fn demote_sweeps_in_ability(def: &mut AbilityDefinition) {
-    let demote = match &*def.effect {
-        Effect::CreateDelayedTrigger { effect, .. } => {
-            crate::parser::oracle_effect::delayed_sweep_is_unbound_anaphor(effect)
+/// Walk one ability chain, binding any `CreateDelayedTrigger` whose inner chain
+/// is an unbound graveyard sweep to its chain's tracked exile set. Recurses into
+/// sub- and else-ability chains, mirroring `delayed_sweep_is_unbound_anaphor`.
+fn bind_unbound_sweeps_in_ability(def: &mut AbilityDefinition) {
+    if let Effect::CreateDelayedTrigger {
+        effect,
+        uses_tracked_set,
+        ..
+    } = &mut *def.effect
+    {
+        if crate::parser::oracle_effect::delayed_sweep_is_unbound_anaphor(effect) {
+            *uses_tracked_set = true;
+            rebind_sweep_target_to_whole_set(effect);
         }
-        _ => false,
-    };
-    if demote {
-        let fragment = def.description.clone().unwrap_or_default();
-        // Replace in place rather than reallocating the Box (clippy::replace_box).
-        *def.effect = Effect::unimplemented("delayed_unplayed_exile_sweep", &fragment);
     }
     if let Some(sub) = def.sub_ability.as_deref_mut() {
-        demote_sweeps_in_ability(sub);
+        bind_unbound_sweeps_in_ability(sub);
     }
     if let Some(els) = def.else_ability.as_deref_mut() {
-        demote_sweeps_in_ability(els);
+        bind_unbound_sweeps_in_ability(els);
+    }
+}
+
+/// Rewrite an anaphoric graveyard sweep target to `TargetFilter::Any` so the
+/// delayed-trigger tracked-set binder maps it to the whole published set
+/// (`bind_tracked_set_to_effect`). Recurses sub-/else-ability chains.
+fn rebind_sweep_target_to_whole_set(def: &mut AbilityDefinition) {
+    match &mut *def.effect {
+        Effect::ChangeZone {
+            destination: Zone::Graveyard,
+            target,
+            ..
+        }
+        | Effect::ChangeZoneAll {
+            destination: Zone::Graveyard,
+            target,
+            ..
+        } if matches!(target, TargetFilter::ParentTarget | TargetFilter::Any) => {
+            *target = TargetFilter::TrackedSet {
+                id: crate::types::identifiers::TrackedSetId(0),
+            };
+        }
+        _ => {}
+    }
+    if let Some(sub) = def.sub_ability.as_deref_mut() {
+        rebind_sweep_target_to_whole_set(sub);
+    }
+    if let Some(els) = def.else_ability.as_deref_mut() {
+        rebind_sweep_target_to_whole_set(els);
     }
 }
 

@@ -830,12 +830,10 @@ fn evaluate_constructed(
     }
 }
 
-/// The gates every custom-format evaluation path (`evaluate_custom_format`,
-/// `quick_custom_format_check`) must pass before its declared card pool can be
-/// trusted, plus the pool itself on success. `Err(reason)` names exactly one
-/// of the three non-`UNRESOLVED` sentinels documented on
-/// [`CUSTOM_FORMAT_UNRESOLVED`] — see that doc comment for which of the three
-/// is genuinely production-reachable versus defense-in-depth.
+/// The gates every name-only custom-format evaluation path must pass before
+/// its declared pool can be trusted, plus that pool on success. Unsupported
+/// formats and historical formats lacking selected printing evidence receive
+/// definite rejection reasons, never the unresolved-format "no opinion" sentinel.
 fn custom_format_pool(
     db: &CardDatabase,
     format_rules: &FormatConfig,
@@ -856,6 +854,13 @@ fn custom_format_pool(
     }
     if !passes_legacy_axis_gate(&rules.legality.legacy) {
         return Err(CUSTOM_FORMAT_UNIMPLEMENTED_LEGACY_AXIS.to_string());
+    }
+    // Selected printings have a separate catalog-backed admission path. A name
+    // alone cannot establish edition or language, including for basic lands.
+    if rules.legality.legacy.printing_policy
+        != crate::types::custom_format::HistoricalPrintingPolicy::Any
+    {
+        return Err("Selected printing records are required for this historical format".into());
     }
     Ok(DeclaredPool::resolve(db, &rules.legality))
 }
@@ -9532,6 +9537,15 @@ mod tests {
         Value::Object(cards).to_string()
     }
 
+    // Ante regressions isolate card-pool/gameplay rules. Printing admission is
+    // covered separately by historical_format_policy integration tests.
+    fn swedish_name_pool_rules() -> CustomFormatRules {
+        let mut rules = crate::types::custom_format::swedish_old_school().rules;
+        rules.legality.legacy.printing_policy =
+            crate::types::custom_format::HistoricalPrintingPolicy::Any;
+        rules
+    }
+
     /// `DeclaredPool` answers ONLY the format's own declared card pool. CR 407.3
     /// is not part of that — it is applied once for every format by
     /// `ante_deck_violations` — so an ante card gets whatever verdict the
@@ -9590,9 +9604,7 @@ mod tests {
     #[test]
     fn both_dispatches_agree_that_an_ante_card_is_illegal() {
         let db = CardDatabase::from_json_str(&ante_db_json()).unwrap();
-        let config = FormatConfig::for_custom_rules(
-            &crate::types::custom_format::swedish_old_school().rules,
-        );
+        let config = FormatConfig::for_custom_rules(&swedish_name_pool_rules());
 
         for summary_only in [false, true] {
             // Paired control FIRST, on the same config and flag: a legal deck
@@ -9662,9 +9674,7 @@ mod tests {
             FormatConfig::two_headed_giant(),
             // DeclaredPool route, for contrast: a format that DOES consult a
             // card pool must reach the same verdict by the same rule.
-            FormatConfig::for_custom_rules(
-                &crate::types::custom_format::swedish_old_school().rules,
-            ),
+            FormatConfig::for_custom_rules(&swedish_name_pool_rules()),
         ] {
             let label = format.format.label();
             let request = DeckCompatibilityRequest {
@@ -9710,14 +9720,11 @@ mod tests {
     /// The sideboard reaches the check only because `construction_deck_cards`
     /// chains it; a main-deck-only regression would not notice if that stopped,
     /// and the sideboard is exactly where a player would try to hide an ante
-    /// card. Uses `swedish_old_school()`'s real rules rather than a synthetic
-    /// config, since the preset is what ships.
+    /// card. Uses the Swedish card pool with printing checks independently tested.
     #[test]
     fn validate_deck_for_format_rejects_ante_cards_in_deck_and_sideboard() {
         let db = CardDatabase::from_json_str(&ante_db_json()).unwrap();
-        let config = FormatConfig::for_custom_rules(
-            &crate::types::custom_format::swedish_old_school().rules,
-        );
+        let config = FormatConfig::for_custom_rules(&swedish_name_pool_rules());
 
         let request_with = |main: Vec<String>, sideboard: Vec<String>| DeckCompatibilityRequest {
             main_deck: main,

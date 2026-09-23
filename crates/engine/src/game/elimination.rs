@@ -968,11 +968,14 @@ fn remove_stack_objects_controlled_by_leaving_players(
         // with the index it occupied at the moment IT was removed, so a replay
         // reproduces both the count and the surviving entries' relative order.
         let mut abandoned_spell_ids = Vec::new();
-        while let Some(idx) = state
-            .stack
-            .iter()
-            .position(|entry| super::stack::stack_object_controller(state, entry) == player)
-        {
+        while let Some(idx) = state.stack.iter().position(|entry| {
+            // Historical combat damage has no controller and survives a
+            // player's departure even when that player assigned it.
+            !matches!(
+                entry.kind,
+                crate::types::game_state::StackEntryKind::CombatDamage { .. }
+            ) && super::stack::stack_object_controller(state, entry) == player
+        }) {
             let removed = super::stack::remove_nonresolving_stack_entry_at(
                 state,
                 idx,

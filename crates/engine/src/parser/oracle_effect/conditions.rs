@@ -3570,6 +3570,58 @@ pub(super) fn strip_mana_value_conditional(text: &str) -> (Option<AbilityConditi
     (None, text.to_string())
 }
 
+/// CR 202.3 + CR 608.2c: Strip a leading "if the card's mana value is N or
+/// greater/less" guard. Inside a "repeat this process" directive the card is the
+/// one the process just revealed/exiled/moved, so the condition reuses
+/// `RevealedHasCardType` with an empty `card_types` and the `additional_filter`
+/// `FilterProp::Cmc` slot: its runtime fallback already reads the just-moved card
+/// from `last_zone_changed_ids` when no reveal occurred (Demonlord Belzenlok's
+/// "exile cards from the top of your library until you exile a nonland card,
+/// then put that card into your hand. If the card's mana value is 4 or greater,
+/// repeat this process.").
+pub(super) fn strip_card_mana_value_conditional(text: &str) -> (Option<AbilityCondition>, String) {
+    let lower = text.to_lowercase();
+    for subject in [
+        "if the card's mana value is ",
+        "if that card's mana value is ",
+        "if the revealed card's mana value is ",
+        "if the exiled card's mana value is ",
+    ] {
+        let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(subject).parse(lower.as_str()) else {
+            continue;
+        };
+        let Ok((rest, n)) = nom_primitives::parse_number(rest) else {
+            continue;
+        };
+        let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(" or ").parse(rest) else {
+            continue;
+        };
+        let Ok((rest, comparator)) = alt((
+            value(Comparator::LE, tag::<_, _, OracleError<'_>>("less")),
+            value(Comparator::GE, tag("greater")),
+        ))
+        .parse(rest) else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(",").parse(rest) else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let body_start = text.len() - rest.len();
+        let condition = AbilityCondition::RevealedHasCardType {
+            card_types: Vec::new(),
+            additional_filter: Some(FilterProp::Cmc {
+                comparator,
+                value: QuantityExpr::Fixed { value: n as i32 },
+            }),
+            subtype_filter: None,
+        };
+        return (Some(condition), text[body_start..].to_string());
+    }
+    (None, text.to_string())
+}
+
 /// CR 608.2c: Strip trailing "if it has the [least|greatest] <property> among
 /// <filter>" from a targeted spell effect (Wretched Banquet class).
 pub(super) fn strip_superlative_target_conditional(

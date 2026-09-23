@@ -168,6 +168,7 @@ fn deck_payload_from_current_pools(state: &GameState) -> Result<DeckPayload, Str
                 .map(|player| player.sticker_sheets.clone())
                 .unwrap_or_default(),
             signature_spell: (*p.current_signature_spell).clone(),
+            conspiracy: (*p.registered_conspiracy).clone(),
             bracket_tier: p.bracket_tier,
         })
         .collect();
@@ -184,6 +185,7 @@ fn deck_payload_from_current_pools(state: &GameState) -> Result<DeckPayload, Str
             contraption_deck: Vec::new(),
             sticker_sheets: state.players[0].sticker_sheets.clone(),
             signature_spell: (*p0.current_signature_spell).clone(),
+            conspiracy: (*p0.registered_conspiracy).clone(),
             bracket_tier: p0.bracket_tier,
         },
         opponent: PlayerDeckPayload {
@@ -197,6 +199,7 @@ fn deck_payload_from_current_pools(state: &GameState) -> Result<DeckPayload, Str
             contraption_deck: Vec::new(),
             sticker_sheets: state.players[1].sticker_sheets.clone(),
             signature_spell: (*p1.current_signature_spell).clone(),
+            conspiracy: (*p1.registered_conspiracy).clone(),
             bracket_tier: p1.bracket_tier,
         },
         ai_decks,
@@ -480,6 +483,22 @@ fn restart_between_games_with_starting_player(
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, String> {
     let payload = deck_payload_from_current_pools(state)?;
+    // CR 702.106a/f: names are chosen anew as each game begins. This
+    // automatic restart has no secret-choice input; starting here would
+    // silently create uncommitted, unusable agendas. Keep the between-games
+    // state intact until the host routes through fresh pregame setup with
+    // load_deck_with_conspiracy_choices (never reuse last game's names).
+    if std::iter::once(&payload.player)
+        .chain(std::iter::once(&payload.opponent))
+        .chain(payload.ai_decks.iter())
+        .any(|deck| {
+            deck.conspiracy.iter().any(|entry| {
+                entry.count > 0 && crate::game::conspiracy::has_hidden_agenda(&entry.card)
+            })
+        })
+    {
+        return Err("Hidden agendas require fresh secret choices before each game; restart through pregame setup".into());
+    }
 
     let mut next_state = GameState::new(
         state.format_config.clone(),
@@ -939,6 +958,26 @@ mod tests {
         assert_eq!(state.match_phase, MatchPhase::BetweenGames);
         assert_eq!(state.match_score.draws, 1);
         assert_eq!(state.next_game_chooser, Some(PlayerId(1)));
+    }
+
+    #[test]
+    fn rematch_retains_conspiracy_slots_for_every_seat() {
+        let mut state = GameState::new_two_player(3);
+        let mut conspiracy = entry("Power Play", 2);
+        conspiracy.card.card_type.core_types = vec![crate::types::card_type::CoreType::Conspiracy];
+        state.deck_pools = (0..3)
+            .map(|seat| PlayerDeckPool {
+                player: PlayerId(seat),
+                registered_conspiracy: std::sync::Arc::new(vec![conspiracy.clone()]),
+                ..Default::default()
+            })
+            .collect();
+        let payload = deck_payload_from_current_pools(&state).unwrap();
+        for deck in [&payload.player, &payload.opponent, &payload.ai_decks[0]] {
+            assert_eq!(deck.conspiracy.len(), 1);
+            assert_eq!(deck.conspiracy[0].card.name, "Power Play");
+            assert_eq!(deck.conspiracy[0].count, 2);
+        }
     }
 
     #[test]

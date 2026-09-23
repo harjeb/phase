@@ -105,6 +105,14 @@ pub fn parse_zone_controller(input: &str) -> OracleResult<'_, ControllerRef> {
         value(ControllerRef::You, tag("you control")),
         value(ControllerRef::Opponent, tag("an opponent controls")),
         value(ControllerRef::Opponent, tag("your opponents control")),
+        // CR 608.2c + CR 109.4: "those opponents control" — anaphor for the
+        // opponent targets chosen earlier in the same ability (Call the
+        // Coppercoats). The object-filter layer carries a single-player
+        // controller scope, and `Opponent` matches every opponent; that is
+        // exactly the chosen population in the two-player games this engine's
+        // host serves. Longest-match-first: "those opponents control" shares no
+        // prefix with the arms above.
+        value(ControllerRef::Opponent, tag("those opponents control")),
         value(ControllerRef::Opponent, tag("you don't control")),
         // CR 109.4 + CR 115.1: "target player controls" — the filter controller
         // is the player chosen as a target of the enclosing ability. The

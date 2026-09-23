@@ -2473,6 +2473,34 @@ fn parse_named_filter_terminator(input: &str) -> Result<(&str, ()), nom::Err<Ora
     .parse(input)
 }
 
+/// CR 607.2d + CR 702.106d/f: linked chosen-name qualifiers. The "other"
+/// name is a chosen name that differs from the triggering spell's name.
+pub(crate) fn parse_chosen_name_suffix(input: &str) -> OracleResult<'_, TargetFilter> {
+    let (rest, _) = tag("with ").parse(input)?;
+    let (rest, filter) = alt((
+        value(TargetFilter::HasChosenName, tag("one of the chosen names")),
+        value(TargetFilter::HasChosenName, tag("the chosen name")),
+        value(TargetFilter::HasChosenName, tag("a name chosen for ~")),
+        value(
+            TargetFilter::And {
+                filters: vec![
+                    TargetFilter::HasChosenName,
+                    TargetFilter::Typed(TypedFilter::default().properties(vec![
+                        FilterProp::SharesQuality {
+                            quality: SharedQuality::Name,
+                            reference: Some(Box::new(TargetFilter::TriggeringSource)),
+                            relation: SharedQualityRelation::DoesNotShare,
+                        },
+                    ])),
+                ],
+            },
+            tag("the other chosen name"),
+        ),
+    ))
+    .parse(rest)?;
+    Ok((rest, filter))
+}
+
 /// Parse a type phrase like "creature", "nonland permanent", "artifact or enchantment",
 /// "creature you control", "creature an opponent controls".
 ///
@@ -3502,6 +3530,12 @@ pub fn parse_type_phrase_folding_with_ctx<'a>(
         }
         properties.extend(suffix.properties);
         pos += consumed;
+    } else if let Some((suffix, consumed)) = parse_that_have_keyword_suffix(&lower[pos..]) {
+        if suffix.disjunctive && suffix.properties.len() > 1 {
+            property_disjunction_ranges.push((properties.len(), suffix.properties.len()));
+        }
+        properties.extend(suffix.properties);
+        pos += consumed;
     }
 
     if let Some((prop, consumed)) = parse_same_name_suffix(&lower[pos..]) {
@@ -4010,19 +4044,14 @@ pub fn parse_type_phrase_folding_with_ctx<'a>(
     // form "with a name chosen for ~" — matching `~` is both correct and verb-/
     // noun-agnostic. Both surface forms are CR-201.2a name-match synonyms and
     // lower identically to a HasChosenName leg. Mirrors the `exiled_by_source`
-    // recognizer above: a pos-tracked boolean wrapped into TargetFilter::And at
+    // recognizer above: a pos-tracked filter wrapped into TargetFilter::And at
     // end-of-function. The static-line analogue ("Spells with the chosen name
     // can't be cast") lives in oracle_static/shared.rs::parse_continuous_subject_filter.
-    let mut has_chosen_name = false;
+    let mut chosen_name_filter = None;
     let remaining_chosen = lower[pos..].trim_start();
     let chosen_offset = lower[pos..].len() - remaining_chosen.len();
-    if let Ok((rest, _)) = alt((
-        tag::<_, _, OracleError<'_>>("with the chosen name"),
-        tag::<_, _, OracleError<'_>>("with a name chosen for ~"),
-    ))
-    .parse(remaining_chosen)
-    {
-        has_chosen_name = true;
+    if let Ok((rest, filter)) = parse_chosen_name_suffix(remaining_chosen) {
+        chosen_name_filter = Some(filter);
         pos += chosen_offset + (remaining_chosen.len() - rest.len());
     }
 
@@ -4329,10 +4358,10 @@ pub fn parse_type_phrase_folding_with_ctx<'a>(
     // for the object path, and of `filter::spell_record_matches_filter` for
     // the spell-record path); the `TargetFilter::HasChosenName` arm of
     // `filter::filter_inner_for_object` compares the object's name to the
-    // source's ChosenAttribute::CardName.
-    let filter = if has_chosen_name {
+    // source's linked ChosenAttribute::CardName choices.
+    let filter = if let Some(chosen_name_filter) = chosen_name_filter {
         TargetFilter::And {
-            filters: vec![filter, TargetFilter::HasChosenName],
+            filters: vec![filter, chosen_name_filter],
         }
     } else {
         filter
@@ -7586,28 +7615,57 @@ fn parse_keyword_suffix(text: &str) -> Option<(KeywordSuffix, usize)> {
     let trimmed = text.trim_start();
     let leading_ws = text.len() - trimmed.len();
     let (after_with, _) = tag::<_, _, OracleError<'_>>("with ").parse(trimmed).ok()?;
-    let mut remaining = after_with;
-    let mut consumed = leading_ws + "with ".len();
+    let (properties, disjunctive, consumed) = parse_keyword_props(after_with, false);
+    if properties.is_empty() {
+        return None;
+    }
+    Some((
+        KeywordSuffix {
+            properties,
+            disjunctive,
+        },
+        leading_ws + "with ".len() + consumed,
+    ))
+}
+
+/// CR 611.3a + CR 702: parse a bare keyword list from already-lowercased text,
+/// emitting `WithKeyword`/`WithoutKeyword` (or their kind forms) per entry.
+/// Shared by the "with "/"without "/"that have " suffixes so the separator
+/// grammar lives in exactly one place. `and/or` is a disjunctive union (CR 702
+/// example: "first strike, double strike, vigilance, and/or haste"), like `or`.
+fn parse_keyword_props(remaining_start: &str, negated: bool) -> (Vec<FilterProp>, bool, usize) {
+    let mut remaining = remaining_start;
     let mut properties = Vec::new();
     let mut disjunctive = false;
-
+    let mut consumed = 0;
     while let Some((keyword_match, keyword_len)) = parse_leading_keyword_match(remaining) {
         match keyword_match {
-            KeywordMatch::Concrete(keyword) => {
-                properties.push(FilterProp::WithKeyword { value: keyword });
-            }
-            KeywordMatch::Kind(kind) => {
-                properties.push(FilterProp::HasKeywordKind { value: kind });
-            }
+            KeywordMatch::Concrete(keyword) => properties.push(if negated {
+                FilterProp::WithoutKeyword { value: keyword }
+            } else {
+                FilterProp::WithKeyword { value: keyword }
+            }),
+            KeywordMatch::Kind(kind) => properties.push(if negated {
+                FilterProp::WithoutKeywordKind { value: kind }
+            } else {
+                FilterProp::HasKeywordKind { value: kind }
+            }),
         }
         consumed += keyword_len;
         remaining = &remaining[keyword_len..];
 
-        // Try keyword list separators in longest-match-first order.
         let mut found_sep = false;
-        for sep in &[", and ", ", or ", " and ", " or ", ", "] {
+        for sep in &[
+            ", and/or ",
+            " and/or ",
+            ", and ",
+            ", or ",
+            " and ",
+            " or ",
+            ", ",
+        ] {
             if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(*sep).parse(remaining) {
-                if matches!(*sep, ", or " | " or ") {
+                if matches!(*sep, ", or " | " or " | ", and/or " | " and/or ") {
                     disjunctive = true;
                 }
                 consumed += sep.len();
@@ -7620,18 +7678,7 @@ fn parse_keyword_suffix(text: &str) -> Option<(KeywordSuffix, usize)> {
             break;
         }
     }
-
-    if properties.is_empty() {
-        None
-    } else {
-        Some((
-            KeywordSuffix {
-                properties,
-                disjunctive,
-            },
-            consumed,
-        ))
-    }
+    (properties, disjunctive, consumed)
 }
 
 /// Parse "without [keyword]" suffix — negated keyword filter.
@@ -7643,42 +7690,34 @@ pub(crate) fn parse_without_keyword_suffix(text: &str) -> Option<(Vec<FilterProp
     let (after_without, _) = tag::<_, _, OracleError<'_>>("without ")
         .parse(trimmed)
         .ok()?;
-    let mut remaining = after_without;
-    let mut consumed = leading_ws + "without ".len();
-    let mut properties = Vec::new();
-
-    while let Some((keyword_match, keyword_len)) = parse_leading_keyword_match(remaining) {
-        match keyword_match {
-            KeywordMatch::Concrete(keyword) => {
-                properties.push(FilterProp::WithoutKeyword { value: keyword });
-            }
-            KeywordMatch::Kind(kind) => {
-                properties.push(FilterProp::WithoutKeywordKind { value: kind });
-            }
-        }
-        consumed += keyword_len;
-        remaining = &remaining[keyword_len..];
-
-        // Try keyword list separators in longest-match-first order.
-        let mut found_sep = false;
-        for sep in &[", and ", ", or ", " and ", " or ", ", "] {
-            if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(*sep).parse(remaining) {
-                consumed += sep.len();
-                remaining = rest;
-                found_sep = true;
-                break;
-            }
-        }
-        if !found_sep {
-            break;
-        }
-    }
-
+    let (properties, _, consumed) = parse_keyword_props(after_without, true);
     if properties.is_empty() {
-        None
-    } else {
-        Some((properties, consumed))
+        return None;
     }
+    Some((properties, leading_ws + "without ".len() + consumed))
+}
+
+/// CR 611.3a + CR 702: relative-clause keyword list — "<type> that have first
+/// strike, double strike, vigilance, and/or haste" (Path of Mettle). Parallels
+/// the "with " suffix but the lead is "that have "/"that has ".
+fn parse_that_have_keyword_suffix(text: &str) -> Option<(KeywordSuffix, usize)> {
+    let trimmed = text.trim_start();
+    let leading_ws = text.len() - trimmed.len();
+    let (after_lead, _) = alt((tag::<_, _, OracleError<'_>>("that have "), tag("that has ")))
+        .parse(trimmed)
+        .ok()?;
+    let lead_len = trimmed.len() - after_lead.len();
+    let (properties, disjunctive, consumed) = parse_keyword_props(after_lead, false);
+    if properties.is_empty() {
+        return None;
+    }
+    Some((
+        KeywordSuffix {
+            properties,
+            disjunctive,
+        },
+        leading_ws + lead_len + consumed,
+    ))
 }
 
 /// CR 201.2: Parse a "with the same name as <referent>" filter suffix, mapping
@@ -8016,6 +8055,16 @@ fn parse_leading_keyword_match(text: &str) -> Option<(KeywordMatch, usize)> {
     }
 
     None
+}
+
+/// True when `text` is exactly one recognized keyword phrase.
+pub(crate) fn is_keyword_phrase(text: &str) -> bool {
+    parse_keyword_match(text.trim()).is_some()
+}
+
+/// Byte length of the recognized keyword phrase at the start of `text`, if any.
+pub(crate) fn starts_with_keyword_phrase(text: &str) -> Option<usize> {
+    parse_leading_keyword_match(text).map(|(_, len)| len)
 }
 
 fn parse_keyword_match(text: &str) -> Option<KeywordMatch> {

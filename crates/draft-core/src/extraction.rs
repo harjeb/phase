@@ -187,6 +187,10 @@ fn extract_set_pool_indexed(
 
     // Track which UUIDs appear in any sheet (for prints eligibility).
     let mut uuids_in_sheets: HashSet<&str> = HashSet::new();
+    // Sheet UUIDs resolved through the possibly cross-set index. A set whose own
+    // `cards` list is empty (Mystery Booster: its sheets point at PLST/CMB
+    // printings) still has a real print run: the resolved sheet membership.
+    let mut resolved_sheet_cards: Vec<&MtgjsonCard> = Vec::new();
 
     // Build sheets, resolving UUIDs against the (possibly cross-set) index.
     let mut sheets = BTreeMap::new();
@@ -195,6 +199,7 @@ fn extract_set_pool_indexed(
         for (uuid, &weight) in &mtg_sheet.cards {
             uuids_in_sheets.insert(uuid.as_str());
             if let Some(card) = card_index.get(uuid.as_str()) {
+                resolved_sheet_cards.push(card);
                 cards.push(SheetCard {
                     name: card.name.clone(),
                     set_code: card.set_code.clone(),
@@ -265,7 +270,7 @@ fn extract_set_pool_indexed(
     // `contains("play")` check was `false` for every card in every set (Play
     // Boosters included) and is unrelated to the `play`/`draft`/`default`
     // product fallback in `MtgjsonBooster::draftable`.
-    let prints: Vec<LimitedCardPrint> = data
+    let mut prints: Vec<LimitedCardPrint> = data
         .cards
         .iter()
         .filter(|c| {
@@ -281,6 +286,25 @@ fn extract_set_pool_indexed(
             booster_eligible: uuids_in_sheets.contains(c.uuid.as_str()),
         })
         .collect();
+    // Add cross-set sheet printings that the set's own `cards` list cannot
+    // describe, so `prints` is the complete booster pool for every set. This is
+    // what makes Mystery Booster draftable: all of its sheets live in PLST and
+    // the playtest sets, leaving its local `cards` list empty.
+    let mut seen: HashSet<String> = prints.iter().map(|p| p.print_id.clone()).collect();
+    for card in resolved_sheet_cards {
+        if !seen.insert(card.uuid.clone()) {
+            continue;
+        }
+        prints.push(LimitedCardPrint {
+            print_id: card.uuid.clone(),
+            name: card.name.clone(),
+            set_code: card.set_code.clone(),
+            collector_number: card.number.clone(),
+            rarity: parse_rarity(&card.rarity),
+            booster_eligible: true,
+        });
+    }
+    prints.sort_by(|a, b| a.print_id.cmp(&b.print_id));
 
     // Build basic_lands: cards with "Basic" in supertypes, deduplicated (set-local).
     let mut basic_lands: Vec<String> = data
@@ -793,6 +817,53 @@ mod tests {
         assert_eq!(pools.len(), 1);
         assert!(pools.contains_key("tst"));
         assert!(!pools.contains_key("prm"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn all_pools_resolves_cross_set_sheets_into_prints() {
+        // Mystery Booster shape: an empty local `cards` list and sheets that
+        // point at printings living in another downloaded set. Without the
+        // cross-set fallback the pool would carry resolved sheets but zero
+        // prints, which `phase-mana` refuses as no pack/printing catalog.
+        let dir = scratch_dir("cross");
+        write_file(
+            &dir,
+            "sup.json",
+            r#"{
+                "data": { "code": "SUP", "name": "Supplement", "cards": [
+                    { "uuid": "uuid-bonus", "name": "Bonus Card", "rarity": "rare",
+                      "number": "7", "setCode": "SUP", "boosterTypes": [], "supertypes": [] }
+                ] }
+            }"#,
+        );
+        write_file(
+            &dir,
+            "mbx.json",
+            r#"{
+                "data": {
+                    "code": "MBX", "name": "Mystery Box",
+                    "booster": { "draft": {
+                        "sheets": { "draft": { "cards": { "uuid-bonus": 1 }, "totalWeight": 1 } },
+                        "boosters": [ { "contents": { "draft": 1 }, "weight": 1 } ],
+                        "boostersTotalWeight": 1
+                    } },
+                    "cards": []
+                }
+            }"#,
+        );
+
+        let pools = extract_all_set_pools(&dir).unwrap();
+        let pool = &pools["mbx"];
+        assert_eq!(pool.sheets["draft"].cards.len(), 1);
+        let print = pool
+            .prints
+            .iter()
+            .find(|p| p.print_id == "uuid-bonus")
+            .expect("cross-set sheet printing must appear in prints");
+        assert_eq!(print.name, "Bonus Card");
+        assert_eq!(print.set_code, "SUP");
+        assert!(print.booster_eligible);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

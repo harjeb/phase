@@ -407,6 +407,7 @@ fn unearth_installs_leaves_battlefield_exile_replacement() {
 /// exercised end to end.
 fn atomic_unearth_creature() -> AtomicCard {
     AtomicCard {
+        rarity: String::new(),
         name: "Hellspark Elemental".to_string(),
         mana_cost: Some("{1}{R}".to_string()),
         colors: vec!["R".to_string()],

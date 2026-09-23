@@ -639,6 +639,41 @@ pub(super) fn valid_source_matches(
     }
 }
 
+/// Combat batches retain the source incarnation in their damage receipt. Use
+/// that pin for source filters so a departed creature is not read as its new
+/// graveyard (or returned battlefield) incarnation.
+fn combat_damage_source_matches(
+    trigger: &TriggerDefinition,
+    state: &GameState,
+    object_id: ObjectId,
+    source_context: &TriggerSourceContext,
+) -> bool {
+    let Some(filter) = &trigger.valid_source else {
+        return true;
+    };
+    let reference = state
+        .damage_dealt_this_turn
+        .iter()
+        .rev()
+        .find(|record| record.source_id == object_id && record.is_combat)
+        .and_then(|record| record.source_incarnation)
+        .map(|incarnation| {
+            crate::types::identifiers::ObjectIncarnationRef::of(object_id, incarnation)
+        });
+    if let Some(super::damage_source::DamageSourceView::Lki(snapshot)) =
+        reference.and_then(|reference| super::damage_source::damage_source_view(state, reference))
+    {
+        return super::filter::matches_target_filter_on_lki_snapshot(
+            state,
+            object_id,
+            snapshot,
+            filter,
+            &super::filter::FilterContext::from_trigger_source(source_context),
+        );
+    }
+    valid_source_matches(trigger, state, object_id, source_context)
+}
+
 fn valid_source_controller_matches(
     trigger: &TriggerDefinition,
     state: &GameState,
@@ -1344,7 +1379,7 @@ fn matching_combat_damage_to_player_sources(
                     return false;
                 }
             }
-            valid_source_matches(trigger, state, *src, source_context)
+            combat_damage_source_matches(trigger, state, *src, source_context)
         })
         .copied()
         .collect()
@@ -1390,7 +1425,11 @@ pub(super) fn match_damage_done(
             return false;
         }
         // Check if trigger requires damage from a specific source
-        if !valid_source_matches(trigger, state, *dmg_source, source_context) {
+        if !if *is_combat {
+            combat_damage_source_matches(trigger, state, *dmg_source, source_context)
+        } else {
+            valid_source_matches(trigger, state, *dmg_source, source_context)
+        } {
             return false;
         }
         // CR 120.2a + CR 120.2b: Check damage kind filter

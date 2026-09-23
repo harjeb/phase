@@ -30180,6 +30180,19 @@ pub(crate) fn parse_named_choice_object_with_provenance(
         // gain that ability") can read at layer evaluation. The bare single
         // keyword choice carries `count: 1`.
         Some(ChoiceType::Keyword { options, count: 1 })
+    } else if let Some((min, max)) = try_parse_number_enumeration(rest) {
+        // CR 608.2d + CR 107.1a: an explicit integer enumeration ("choose 1, 2,
+        // or 3[ at random]") is the finite closed-range form of a number
+        // choice. Binding it as `NumberRange` (rather than a `Labeled` string
+        // list) makes the game-selected value persist as a typed
+        // `ChoiceValue::Number`, which a downstream "mill that many cards"
+        // reads (Tibalt's Trickery). A non-contiguous enumeration declines
+        // above and falls through to the generic labeled choice.
+        Some(ChoiceType::NumberRange {
+            min,
+            max: Some(max),
+            distinctness: NumberDistinctness::Repeatable,
+        })
     } else {
         // Generic "X or Y" / "X, Y, or Z" / "W, X, Y, or Z" labeled choice —
         // must come AFTER all specific patterns above. Keep this helper
@@ -30358,6 +30371,42 @@ fn try_parse_keyword_choice_from_among(rest: &str) -> Option<(Vec<Keyword>, usiz
 /// This must come AFTER all specific patterns in `try_parse_named_choice` to
 /// avoid accidentally matching "choose left or right" against targeting
 /// patterns.
+/// CR 107.1a + CR 608.2d: "1, 2, or 3[ at random]" — an explicit enumeration of
+/// integer choices. Returns `(min, max)` when the listed integers are
+/// CONSECUTIVE, i.e. the enumerated set is exactly the closed range `min..=max`;
+/// a non-contiguous set ("1, 2, or 4") has no `NumberRange` representation and
+/// declines so the caller falls through to the generic labeled choice. The
+/// trailing " at random" qualifier is captured separately by the caller
+/// (`TargetSelectionMode::Random`) but must be consumed here so it does not leak
+/// into a label.
+fn try_parse_number_enumeration(rest: &str) -> Option<(u32, u32)> {
+    // allow-noncombinator: strip the already-captured free-floating qualifier
+    // before tokenizing the enumeration; the caller records `Random` separately.
+    let rest = rest.strip_suffix(" at random").unwrap_or(rest).trim_end();
+    // Require an explicit list separator so a single number never looks like an
+    // enumeration.
+    if !(rest.contains(',') || rest.contains(" or ")) {
+        return None;
+    }
+    let mut nums: Vec<u32> = Vec::new();
+    for token in rest.split(|c: char| c == ',' || c.is_whitespace()) {
+        if token.is_empty() || token == "or" {
+            continue;
+        }
+        // A non-numeric label declines the whole enumeration (falls through to
+        // the generic labeled choice).
+        nums.push(token.parse::<u32>().ok()?);
+    }
+    if nums.len() < 2 {
+        return None;
+    }
+    nums.sort_unstable();
+    nums.dedup();
+    let min = *nums.first()?;
+    let max = *nums.last()?;
+    (nums.len() as u32 == max - min + 1).then_some((min, max))
+}
+
 fn try_parse_labeled_choice(rest: &str) -> Option<Vec<String>> {
     // N-ary Oxford-comma form first: split on the LAST ", or " (which `split_once_on`
     // finds as the first occurrence of the separator — there's only one in well-formed
@@ -34516,11 +34565,21 @@ fn try_parse_repeat_process_directive(
             if card_type.is_some() {
                 (card_type, rest)
             } else {
-                let (milled, rest) = strip_milled_shared_quality_conditional(text);
-                if milled.is_some() {
-                    (milled, rest)
+                // CR 202.3 + CR 608.2c: "if the card's mana value is N or
+                // greater/less" — a property gate on the same just-processed
+                // card (Demonlord Belzenlok). Runs after the card-TYPE stripper
+                // (which owns "if it's a <type> card") and before the general
+                // inner-condition path.
+                let (mana_value, rest) = strip_card_mana_value_conditional(text);
+                if mana_value.is_some() {
+                    (mana_value, rest)
                 } else {
-                    strip_leading_general_conditional(text, ctx)
+                    let (milled, rest) = strip_milled_shared_quality_conditional(text);
+                    if milled.is_some() {
+                        (milled, rest)
+                    } else {
+                        strip_leading_general_conditional(text, ctx)
+                    }
                 }
             }
         }

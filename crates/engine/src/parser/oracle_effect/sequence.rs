@@ -1817,7 +1817,14 @@ fn split_comma_clause_boundary(current: &str, remainder: &str) -> Option<(Clause
     let whitespace_len = remainder.len() - trimmed.len();
     let trimmed_lower = trimmed.to_ascii_lowercase();
 
-    if starts_prefix_clause(&current_lower) {
+    // CR 608.2c + CR 608.2j: a leading `for each <qty>, ` prefix owns the comma
+    // that separates its iteration count from the body (peel_for_each_prefix
+    // splits on exactly that comma). The clause-so-far may carry a leading
+    // sequence connector from a `. Then ` split ("Then for each blight counter
+    // on it"), so strip it before consulting the prefix table — otherwise the
+    // connector hides the `for each ` head and the comma is misread as a clause
+    // boundary, orphaning the quantifier from its body (Rottenmouth Viper).
+    if starts_prefix_clause(strip_sequence_connector_lower(&current_lower)) {
         return None;
     }
 
@@ -8835,7 +8842,9 @@ fn try_parse_put_counters_on_token_followup(lower: &str) -> Option<ContinuationA
 fn parse_keyword_list(input: &str) -> nom::IResult<&str, Vec<Keyword>, OracleError<'_>> {
     let separator = |i| -> nom::IResult<&str, (), OracleError<'_>> {
         alt((
-            value((), tag::<_, _, OracleError<'_>>(", and ")),
+            value((), tag::<_, _, OracleError<'_>>(", and/or ")),
+            value((), tag(" and/or ")),
+            value((), tag(", and ")),
             value((), tag(", ")),
             value((), tag(" and ")),
         ))

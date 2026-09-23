@@ -18,6 +18,7 @@ use crate::types::triggers::TriggerMode;
 /// Build an `AtomicCard` for a single card face from its oracle `text`.
 fn atomic(name: &str, type_line: &str, types: &[&str], text: &str) -> AtomicCard {
     AtomicCard {
+        rarity: String::new(),
         name: name.to_string(),
         mana_cost: Some("{4}{W}{W}".to_string()),
         colors: vec!["W".to_string()],

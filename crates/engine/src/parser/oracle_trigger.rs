@@ -10563,6 +10563,32 @@ fn continues_spell_color_disjunction(after_comma: &str) -> bool {
     rest.is_empty() || tag::<_, _, OracleError<'_>>(",").parse(rest).is_ok()
 }
 
+/// CR 611.3a + CR 702: a comma inside a relative-clause keyword list
+/// ("... creatures that have first strike, double strike, vigilance, and/or
+/// haste, transform ~", Path of Mettle) is not the trigger/effect boundary.
+/// Requires the text before the comma to end with a keyword phrase, so an
+/// effect that merely BEGINS with a keyword word is not treated as a list
+/// continuation.
+fn continues_keyword_list(prefix: &str, after_comma: &str) -> bool {
+    use crate::parser::oracle_target::{is_keyword_phrase, starts_with_keyword_phrase};
+    let prefix = prefix.trim_end();
+    let tail_start = [" and/or ", " and ", " or ", ", ", "that have ", "that has "]
+        .iter()
+        .filter_map(|sep| prefix.rfind(sep).map(|i| i + sep.len()))
+        .max()
+        .unwrap_or(0);
+    if !is_keyword_phrase(&prefix[tail_start..]) {
+        return false;
+    }
+    let after = after_comma.trim_start();
+    let after = after
+        .strip_prefix("and/or ")
+        .or_else(|| after.strip_prefix("and "))
+        .or_else(|| after.strip_prefix("or "))
+        .unwrap_or(after);
+    starts_with_keyword_phrase(after).is_some()
+}
+
 fn find_effect_boundary(lower: &str) -> Option<usize> {
     use super::oracle_nom::primitives::split_once_on;
     let mut search_start = 0;
@@ -10573,6 +10599,7 @@ fn find_effect_boundary(lower: &str) -> Option<usize> {
             && !continues_serial_event_condition(after)
             && !continues_spell_quality_disjunction(after)
             && !continues_spell_color_disjunction(after)
+            && !continues_keyword_list(&lower[..comma_pos], after)
         {
             return Some(comma_pos);
         }
@@ -16214,8 +16241,11 @@ fn try_parse_attack_with_n_creatures(lower: &str) -> Option<(TriggerMode, Trigge
     // CR 508.1 + CR 603.2c: a leading "exactly " flags an EQ attacker-count
     // constraint (Love on the Battlefield's "attack with exactly two creatures").
     // Optional; when absent, the trailing quantifier axis below decides.
-    let (after_exactly, exactly) = opt(tag::<_, _, OracleError<'_>>("exactly "))
+    let (after_at_least, at_least) = opt(tag::<_, _, OracleError<'_>>("at least "))
         .parse(after_with)
+        .ok()?;
+    let (after_exactly, exactly) = opt(tag::<_, _, OracleError<'_>>("exactly "))
+        .parse(after_at_least)
         .ok()?;
 
     // Parse the count word/digit. `parse_number` already maps "one"→1 as well as
@@ -16237,7 +16267,9 @@ fn try_parse_attack_with_n_creatures(lower: &str) -> Option<(TriggerMode, Trigge
     // returns `None` for that bare form, preserving the pre-existing behavior
     // exactly and avoiding newly defaulting it to EQ (which would over-narrow
     // legacy GE cards).
-    let comparator = if exactly.is_some() {
+    let comparator = if at_least.is_some() {
+        Comparator::GE
+    } else if exactly.is_some() {
         Comparator::EQ
     } else {
         trailing?
@@ -19160,6 +19192,13 @@ pub(crate) fn extract_colored_mana_symbol_spell_qualifier(text: &str) -> Option<
 
 pub(crate) fn parse_post_spell_modifier(modifier: &str) -> Option<TargetFilter> {
     use crate::types::ability::{FilterProp, TypedFilter};
+
+    // CR 702.106d/f: preserve the linked name qualifier on cast triggers.
+    if let Ok((_, filter)) =
+        all_consuming(super::oracle_target::parse_chosen_name_suffix).parse(modifier)
+    {
+        return Some(filter);
+    }
 
     // CR 715.2a: The post-spell path recognizes only the Adventure qualifier.
     // Other relative clauses must fall through to the existing type-phrase

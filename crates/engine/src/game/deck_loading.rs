@@ -94,6 +94,11 @@ pub struct PlayerDeckPayload {
     /// the Oathbreaker. Empty for all non-Oathbreaker formats.
     #[serde(default)]
     pub signature_spell: Vec<DeckEntry>,
+    /// CR 905.4: Conspiracy cards this player begins the game with in the
+    /// command zone. Hidden-agenda conspiracies (CR 905.4a) start face down
+    /// and may be revealed any time their controller has priority.
+    #[serde(default)]
+    pub conspiracy: Vec<DeckEntry>,
     /// The declared bracket tier for this player's deck. Defaults to `Core`
     /// so that existing serialized payloads and test fixtures that omit the
     /// field continue to deserialize correctly.
@@ -143,6 +148,9 @@ pub struct PlayerDeckList {
     /// Oathbreaker RC: the signature spell card name. Empty for all non-Oathbreaker formats.
     #[serde(default)]
     pub signature_spell: Vec<String>,
+    /// CR 905.4: Conspiracy cards placed in the command zone at game start.
+    #[serde(default)]
+    pub conspiracy: Vec<String>,
     /// Declared bracket tier for this player's deck. Defaults to `Core` for
     /// backward-compatible deserialization (payloads that predate this field
     /// omit it, which `#[serde(default)]` handles transparently).
@@ -256,6 +264,13 @@ fn resolve_names(db: &CardDatabase, names: &[String]) -> Vec<DeckEntry> {
     entries
 }
 
+// Conspiracy indices identify physical copies carrying separate secret names.
+// Preserve submitted order, including interleaved duplicates.
+fn resolve_conspiracies(db: &CardDatabase, names: &[String]) -> Vec<DeckEntry> {
+    names.iter().filter_map(|name| db.get_face_by_name(name))
+        .map(|face| DeckEntry::from_resolved_face(db, face, 1)).collect()
+}
+
 /// Resolve a single player's deck list (name-only) into a `PlayerDeckPayload`
 /// using a `CardDatabase` for lookup. Unresolvable names are silently skipped.
 ///
@@ -275,6 +290,7 @@ pub fn resolve_player_deck_list(db: &CardDatabase, list: &PlayerDeckList) -> Pla
         contraption_deck: resolve_names(db, &list.contraption_deck),
         sticker_sheets: list.sticker_sheets.clone(),
         signature_spell: resolve_names(db, &list.signature_spell),
+        conspiracy: resolve_conspiracies(db, &list.conspiracy),
         bracket_tier: list.bracket_tier,
     }
 }
@@ -299,6 +315,7 @@ pub fn resolve_deck_list(db: &CardDatabase, list: &DeckList) -> DeckPayload {
             contraption_deck: resolve_names(db, &list.player.contraption_deck),
             sticker_sheets: list.player.sticker_sheets.clone(),
             signature_spell: resolve_names(db, &list.player.signature_spell),
+            conspiracy: resolve_conspiracies(db, &list.player.conspiracy),
             bracket_tier: list.player.bracket_tier,
         },
         opponent: PlayerDeckPayload {
@@ -312,6 +329,7 @@ pub fn resolve_deck_list(db: &CardDatabase, list: &DeckList) -> DeckPayload {
             contraption_deck: resolve_names(db, &list.opponent.contraption_deck),
             sticker_sheets: list.opponent.sticker_sheets.clone(),
             signature_spell: resolve_names(db, &list.opponent.signature_spell),
+            conspiracy: resolve_conspiracies(db, &list.opponent.conspiracy),
             bracket_tier: list.opponent.bracket_tier,
         },
         ai_decks: list
@@ -328,6 +346,7 @@ pub fn resolve_deck_list(db: &CardDatabase, list: &DeckList) -> DeckPayload {
                 contraption_deck: resolve_names(db, &deck.contraption_deck),
                 sticker_sheets: deck.sticker_sheets.clone(),
                 signature_spell: resolve_names(db, &deck.signature_spell),
+                conspiracy: resolve_conspiracies(db, &deck.conspiracy),
                 bracket_tier: deck.bracket_tier,
             })
             .collect(),
@@ -492,6 +511,7 @@ fn momir_fixed_deck_payload(db: &CardDatabase, submitted: &DeckPayload) -> DeckP
         contraption_deck: Vec::new(),
         sticker_sheets: Vec::new(),
         signature_spell: Vec::new(),
+        conspiracy: Vec::new(),
         bracket_tier: CommanderBracketTier::default(),
     };
     DeckPayload {
@@ -742,7 +762,152 @@ pub fn create_signature_spell_from_card_face(
     obj_id
 }
 
+/// CR 905.4 / CR 905.4a: Create a conspiracy card object and begin the game
+/// with it in the command zone. A hidden-agenda conspiracy (CR 702.106) starts
+/// face down; every other conspiracy starts face up.
+pub fn create_conspiracy_from_card_face(
+    state: &mut GameState,
+    card_face: &CardFace,
+    owner: PlayerId,
+) -> Option<crate::types::identifiers::ObjectId> {
+    // CR 905.4: only conspiracy cards may occupy this pregame slot.
+    if !card_face
+        .card_type
+        .core_types
+        .contains(&CoreType::Conspiracy)
+    {
+        return None;
+    }
+    let card_id = CardId(state.next_object_id);
+    let obj_id = create_object(state, card_id, owner, card_face.name.clone(), Zone::Command);
+    let obj = state.objects.get_mut(&obj_id).expect("just created");
+    apply_card_face_to_object(obj, card_face);
+    let hidden = crate::game::conspiracy::has_hidden_agenda(card_face);
+    crate::game::conspiracy::start_with_conspiracy(state, obj_id, hidden);
+    Some(obj_id)
+}
+
+/// A secret pregame commitment for one physical conspiracy. `index` is the
+/// zero-based index after expanding that seat's conspiracy entries by count.
+/// Transport must never broadcast this payload, including in rematch messages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConspiracyChoice {
+    pub player: PlayerId,
+    pub index: usize,
+    pub choices: Vec<crate::types::ability::ChosenAttribute>,
+}
+
+/// Validate secret names against the server's Oracle catalog before mutating
+/// state. Call with a fresh game state and submit fresh commitments for every
+/// game, including rematches; deck pools deliberately retain cards, not last
+/// game's secret decisions.
+///
+/// CR 702.106a/b/f: each hidden agenda gets one secret name (two distinct names
+/// for double agenda). CR 201.4: names must exist in the Oracle reference.
+/// CR 702.106d: the linked effect reads only this conspiracy's commitments.
+pub fn load_deck_with_conspiracy_choices(
+    state: &mut GameState,
+    payload: &DeckPayload,
+    commitments: &[ConspiracyChoice],
+    db: &CardDatabase,
+) -> Result<(), String> {
+    use crate::types::ability::ChosenAttribute;
+    // CR 702.106a/f: only bind names while placing conspiracies for a new
+    // game. The deck loader appends objects; reusing a prior game's state
+    // would bind fresh names to its old (possibly revealed) conspiracies.
+    if state
+        .objects
+        .values()
+        .any(crate::game::conspiracy::is_conspiracy)
+    {
+        return Err("Conspiracy commitments require a fresh game state".into());
+    }
+    let decks: Vec<_> = std::iter::once(&payload.player)
+        .chain(std::iter::once(&payload.opponent))
+        .chain(payload.ai_decks.iter())
+        .collect();
+    let mut validated = Vec::new();
+    let mut used = HashSet::new();
+    for (seat, deck) in decks.iter().enumerate() {
+        let player = PlayerId(seat as u8);
+        for (index, entry) in deck
+            .conspiracy
+            .iter()
+            .flat_map(|entry| std::iter::repeat_n(entry, entry.count as usize))
+            .enumerate()
+        {
+            if !entry
+                .card
+                .card_type
+                .core_types
+                .contains(&CoreType::Conspiracy)
+            {
+                return Err("Non-conspiracy card in conspiracy slot".into());
+            }
+            let required = crate::game::conspiracy::agenda_name_count(&entry.card);
+            let matching: Vec<_> = commitments
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.player == player && c.index == index)
+                .collect();
+            if required == 0 && matching.is_empty() {
+                continue;
+            }
+            if matching.len() != 1 || matching[0].1.choices.len() != required || required == 0 {
+                return Err("Missing, duplicate, or unexpected conspiracy commitment".into());
+            }
+            let (commitment_index, commitment) = matching[0];
+            used.insert(commitment_index);
+            let mut names = Vec::new();
+            for choice in &commitment.choices {
+                let ChosenAttribute::CardName(name) = choice else {
+                    return Err("Conspiracy choices must be card names".into());
+                };
+                let face = db
+                    .get_face_by_name(name.trim())
+                    .ok_or("Unknown conspiracy chosen card name")?;
+                // CR 201.4b: lookup accepts combined split names for deck
+                // loading, but naming must select an actual individual face.
+                if face.name.to_lowercase() != name.trim().to_lowercase() {
+                    return Err("Choose an individual Oracle card face name".into());
+                }
+                let chosen = ChosenAttribute::CardName(face.name.clone());
+                if names.contains(&chosen) {
+                    return Err("Double agenda requires different card names".into());
+                }
+                names.push(chosen);
+            }
+            validated.push((player, index, names));
+        }
+    }
+    if used.len() != commitments.len() {
+        return Err("Conspiracy commitment refers to an unknown seat or copy".into());
+    }
+    load_and_hydrate_decks(state, payload, Some(db));
+    for (player, index, choices) in validated {
+        let id = state
+            .command_zone
+            .iter()
+            .copied()
+            .filter(|id| {
+                state.objects.get(id).is_some_and(|obj| {
+                    obj.owner == player && crate::game::conspiracy::is_conspiracy(obj)
+                })
+            })
+            .nth(index)
+            .expect("validated conspiracy was loaded");
+        state
+            .objects
+            .get_mut(&id)
+            .expect("loaded conspiracy")
+            .chosen_attributes = choices;
+    }
+    Ok(())
+}
+
 /// Load deck data into a GameState, creating GameObjects in each player's library and shuffling.
+/// Hidden agendas loaded through this legacy entry point cannot be revealed:
+/// use `load_deck_with_conspiracy_choices` for a playable pregame commitment.
 pub fn load_deck_into_state(state: &mut GameState, payload: &DeckPayload) {
     state.booster_pack_pool = payload.booster_pack_pool.clone().map(Arc::new);
     state.booster_shelf = Arc::default();
@@ -912,6 +1077,7 @@ pub fn load_deck_into_state(state: &mut GameState, payload: &DeckPayload) {
             current_signature_spell: p0_sig,
             registered_planar_deck: p0_planar,
             registered_scheme_deck: std::sync::Arc::clone(&p0_scheme),
+            registered_conspiracy: Arc::new(payload.player.conspiracy.clone()),
             current_scheme_deck: p0_scheme,
             bracket_tier: payload.player.bracket_tier,
         });
@@ -937,6 +1103,7 @@ pub fn load_deck_into_state(state: &mut GameState, payload: &DeckPayload) {
             current_signature_spell: p1_sig,
             registered_planar_deck: std::sync::Arc::new(Vec::new()),
             registered_scheme_deck: std::sync::Arc::clone(&p1_scheme),
+            registered_conspiracy: Arc::new(payload.opponent.conspiracy.clone()),
             current_scheme_deck: p1_scheme,
             bracket_tier: payload.opponent.bracket_tier,
         });
@@ -964,6 +1131,7 @@ pub fn load_deck_into_state(state: &mut GameState, payload: &DeckPayload) {
                 current_signature_spell: sig,
                 registered_planar_deck: std::sync::Arc::new(Vec::new()),
                 registered_scheme_deck: std::sync::Arc::clone(&scheme),
+                registered_conspiracy: Arc::new(ai_deck.conspiracy.clone()),
                 current_scheme_deck: scheme,
                 bracket_tier: ai_deck.bracket_tier,
             });
@@ -1064,6 +1232,33 @@ pub fn load_deck_into_state(state: &mut GameState, payload: &DeckPayload) {
             for entry in entries {
                 for _ in 0..entry.count {
                     create_signature_spell_from_card_face(state, &entry.card, owner);
+                }
+            }
+        }
+    }
+
+    // CR 905.4: each player begins the game with the conspiracy cards supplied
+    // in their `conspiracy` slot in the command zone. Hidden-agenda
+    // conspiracies (CR 905.4a) enter face down and can be revealed later.
+    {
+        let conspiracy_decks: Vec<(PlayerId, &[DeckEntry])> =
+            std::iter::once((PlayerId(0), payload.player.conspiracy.as_slice()))
+                .chain(std::iter::once((
+                    PlayerId(1),
+                    payload.opponent.conspiracy.as_slice(),
+                )))
+                .chain(
+                    payload
+                        .ai_decks
+                        .iter()
+                        .enumerate()
+                        .map(|(i, d)| (PlayerId((2 + i) as u8), d.conspiracy.as_slice())),
+                )
+                .collect();
+        for (owner, entries) in conspiracy_decks {
+            for entry in entries {
+                for _ in 0..entry.count {
+                    create_conspiracy_from_card_face(state, &entry.card, owner);
                 }
             }
         }
@@ -1537,6 +1732,157 @@ mod tests {
         let obj = &state.objects[&obj_id];
         assert!(obj.power.is_none());
         assert!(obj.toughness.is_none());
+    }
+
+    fn make_conspiracy_face(name: &str, hidden_agenda: bool) -> CardFace {
+        let mut face = make_creature_face();
+        face.name = name.to_string();
+        face.card_type.core_types = vec![crate::types::card_type::CoreType::Conspiracy];
+        face.oracle_text = hidden_agenda
+            .then(|| "Hidden agenda (Start the game with this conspiracy face down.)".to_string());
+        face
+    }
+
+    #[test]
+    fn conspiracy_slot_rejects_other_card_types_without_creating_an_object() {
+        let mut state = GameState::new_two_player(1);
+        let mut face = make_conspiracy_face("Cogwork Librarian", false);
+        face.card_type.core_types = vec![CoreType::Artifact, CoreType::Creature];
+        let before = state.objects.len();
+        assert!(create_conspiracy_from_card_face(&mut state, &face, PlayerId(0)).is_none());
+        assert_eq!(state.objects.len(), before);
+    }
+
+    #[test]
+    fn create_conspiracy_from_card_face_starts_in_command_zone() {
+        let mut state = GameState::new_two_player(42);
+        let face = make_conspiracy_face("Power Play", false);
+        let id = create_conspiracy_from_card_face(&mut state, &face, PlayerId(0)).unwrap();
+
+        let obj = &state.objects[&id];
+        assert_eq!(obj.zone, Zone::Command);
+        assert!(
+            !obj.face_down,
+            "a non-hidden-agenda conspiracy starts face up"
+        );
+        assert_eq!(obj.controller, PlayerId(0));
+        assert!(state.command_zone.contains(&id));
+        assert!(crate::game::conspiracy::functions_from_command_zone(obj));
+    }
+
+    #[test]
+    fn double_agenda_also_starts_face_down() {
+        let mut state = GameState::new_two_player(42);
+        let mut face = make_conspiracy_face("Summoner's Bond", false);
+        // MTGJSON Oracle text; double agenda is the CR 702.106f variant.
+        face.oracle_text = Some("Double agenda (Start the game with this conspiracy face down in the command zone and secretly choose two different card names. You may turn this conspiracy face up any time and reveal those names.)\nWhenever you cast a creature spell with one of the chosen names, you may search your library for a creature card with the other chosen name, reveal it, put it into your hand, then shuffle.".into());
+        let id = create_conspiracy_from_card_face(&mut state, &face, PlayerId(0)).unwrap();
+        assert!(state.objects[&id].face_down);
+    }
+
+    #[test]
+    fn hidden_agenda_conspiracy_starts_face_down_until_revealed() {
+        let mut state = GameState::new_two_player(42);
+        let face = make_conspiracy_face("Secret Summoning", true);
+        let id = create_conspiracy_from_card_face(&mut state, &face, PlayerId(0)).unwrap();
+
+        // CR 905.4a: a hidden-agenda conspiracy starts face down and does not function.
+        assert!(state.objects[&id].face_down);
+        assert!(!crate::game::conspiracy::functions_from_command_zone(
+            &state.objects[&id]
+        ));
+
+        // CR 702.106a: legacy setup without a secret name cannot be revealed.
+        assert!(!crate::game::conspiracy::turn_hidden_agenda_face_up(
+            &mut state,
+            id,
+            PlayerId(0)
+        ));
+        state.objects.get_mut(&id).unwrap().chosen_attributes.push(
+            crate::types::ability::ChosenAttribute::CardName("Forest".into()),
+        );
+        // CR 702.106: its controller may turn it face up.
+        assert!(crate::game::conspiracy::turn_hidden_agenda_face_up(
+            &mut state,
+            id,
+            PlayerId(0)
+        ));
+        assert!(!state.objects[&id].face_down);
+        assert!(crate::game::conspiracy::functions_from_command_zone(
+            &state.objects[&id]
+        ));
+
+        // CR 905.4a: revealing an already-face-up conspiracy is a no-op.
+        assert!(!crate::game::conspiracy::turn_hidden_agenda_face_up(
+            &mut state,
+            id,
+            PlayerId(0)
+        ));
+    }
+
+    #[test]
+    fn load_deck_ignores_non_conspiracy_cards_in_conspiracy_slots() {
+        let mut state = GameState::new_two_player(42);
+        let payload = DeckPayload {
+            player: PlayerDeckPayload {
+                conspiracy: vec![DeckEntry {
+                    card: make_creature_face(),
+                    count: 1,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        load_deck_into_state(&mut state, &payload);
+        assert!(state.command_zone.is_empty());
+        assert!(state.objects.is_empty());
+    }
+
+    #[test]
+    fn load_deck_places_conspiracies_from_payload_slots() {
+        let mut state = GameState::new_two_player(42);
+        let payload = DeckPayload {
+            player: PlayerDeckPayload {
+                conspiracy: vec![
+                    DeckEntry {
+                        card: make_conspiracy_face("Power Play", false),
+                        count: 1,
+                    },
+                    DeckEntry {
+                        card: make_conspiracy_face("Secret Summoning", true),
+                        count: 2,
+                    },
+                ],
+                ..Default::default()
+            },
+            opponent: PlayerDeckPayload {
+                conspiracy: vec![DeckEntry {
+                    card: make_conspiracy_face("Advantageous Proclamation", false),
+                    count: 1,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        load_deck_into_state(&mut state, &payload);
+
+        assert_eq!(state.deck_pools[0].registered_conspiracy.len(), 2);
+        assert_eq!(state.deck_pools[1].registered_conspiracy.len(), 1);
+        assert_eq!(state.command_zone.len(), 4, "1 + 2 human and 1 opponent");
+        assert!(state
+            .command_zone
+            .iter()
+            .all(|id| state.objects[id].zone == Zone::Command));
+        let faces_down = state
+            .command_zone
+            .iter()
+            .filter(|id| state.objects[id].face_down)
+            .count();
+        assert_eq!(
+            faces_down, 2,
+            "the two hidden-agenda conspiracies start face down"
+        );
     }
 
     #[test]

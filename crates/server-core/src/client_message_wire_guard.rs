@@ -76,6 +76,10 @@ pub fn guard_client_message_before_dispatch(
     _mode: ServerMode,
 ) -> Result<(), String> {
     match msg {
+        #[cfg(feature = "manabrew")]
+        ClientMessage::ManabrewSnapshot => Ok(()),
+        #[cfg(feature = "manabrew")]
+        ClientMessage::ManabrewResponse { message, .. } => crate::manabrew::guard_message(message),
         ClientMessage::ClientHello {
             client_version,
             build_commit,
@@ -334,6 +338,10 @@ pub fn guard_client_message_before_dispatch(
 /// non-hostile client can trip MUST answer on `ActionRejected`.
 pub fn wire_rejection_message(msg: &ClientMessage, reason: String) -> ServerMessage {
     match msg {
+        #[cfg(feature = "manabrew")]
+        ClientMessage::ManabrewSnapshot | ClientMessage::ManabrewResponse { .. } => {
+            ServerMessage::ActionFailed { message: reason }
+        }
         // An oversized interaction response is reachable without hostility:
         // `TextChoiceProjection::allow_arbitrary` accepts free-form text and
         // `MAX_INTERACTION_STRING_LEN` is 256, so a long paste is a rejected
@@ -419,6 +427,10 @@ pub fn wire_rejection_message(msg: &ClientMessage, reason: String) -> ServerMess
 /// token vectors.
 pub fn guard_broker_projection_inbound(msg: &ClientMessage) -> Result<(), String> {
     match msg {
+        #[cfg(feature = "manabrew")]
+        ClientMessage::ManabrewSnapshot | ClientMessage::ManabrewResponse { .. } => {
+            Err("ManaBrew requires an authoritative Full server".into())
+        }
         ClientMessage::ClientHello {
             client_version,
             build_commit,

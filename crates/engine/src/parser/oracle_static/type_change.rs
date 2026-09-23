@@ -3200,6 +3200,73 @@ pub(crate) fn parse_all_creature_types_grant(
     )
 }
 
+/// CR 205.3i + CR 305.7: Parse "<subject> {is|are} every nonbasic land type" —
+/// the land analog of [`parse_all_creature_types_grant`]. Grants every
+/// nonbasic land subtype additively, one `AddSubtype` per entry of the
+/// canonical [`LAND_SUBTYPES`](crate::types::card_type::LAND_SUBTYPES) table
+/// excluding the five basic land types (CR 305.6, owned by
+/// `AddAllBasicLandTypes`). Built for the whole "is every nonbasic land type"
+/// class (Planar Nexus), not one card.
+///
+/// Self-reference (`~`) functions in all zones as a CDA, mirroring the
+/// creature-type sibling and Changeling (CR 604.3); a land-filter subject
+/// produces an ordinary battlefield-scoped continuous static.
+pub(crate) fn parse_all_nonbasic_land_types_grant(
+    tp: &TextPair<'_>,
+    text: &str,
+) -> Option<StaticDefinition> {
+    let (subject_tp, rest_tp) = tp
+        .split_around(" is every nonbasic land type")
+        .or_else(|| tp.split_around(" are every nonbasic land type"))?;
+    // The predicate must terminate the line modulo punctuation and the ordinary
+    // additive extension "in addition to its/their other [land] types".
+    let tail = rest_tp.lower.trim().trim_end_matches('.').trim();
+    let additive_tails = [
+        "",
+        "in addition to its other types",
+        "in addition to their other types",
+        "in addition to its other land types",
+        "in addition to their other land types",
+    ];
+    if !additive_tails.contains(&tail) {
+        return None;
+    }
+    let subject = subject_tp.lower.trim();
+
+    let nonbasic_land_types: Vec<ContinuousModification> = crate::types::card_type::LAND_SUBTYPES
+        .iter()
+        .filter(|subtype| {
+            !crate::types::ability::BasicLandType::all()
+                .iter()
+                .any(|basic| basic.as_subtype_str() == **subtype)
+        })
+        .map(|subtype| ContinuousModification::AddSubtype {
+            subtype: (*subtype).to_string(),
+        })
+        .collect();
+    if nonbasic_land_types.is_empty() {
+        return None;
+    }
+
+    if subject == "~" {
+        return Some(
+            StaticDefinition::continuous()
+                .affected(TargetFilter::SelfRef)
+                .modifications(nonbasic_land_types)
+                .cda()
+                .description(text.to_string()),
+        );
+    }
+
+    let affected = parse_land_type_change_subject(subject)?;
+    Some(
+        StaticDefinition::continuous()
+            .affected(affected)
+            .modifications(nonbasic_land_types)
+            .description(text.to_string()),
+    )
+}
+
 /// CR 205.3 + CR 613.1d: Map the subject of an "{is|are} every creature
 /// type" static into a TargetFilter restricting which battlefield objects
 /// receive the grant. Sibling of `parse_land_type_change_subject` for the

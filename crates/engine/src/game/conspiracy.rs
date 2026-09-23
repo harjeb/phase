@@ -30,6 +30,7 @@
 //! draft engine.
 
 use crate::game::game_object::GameObject;
+use crate::types::card::CardFace;
 use crate::types::card_type::CoreType;
 use crate::types::game_state::GameState;
 use crate::types::identifiers::ObjectId;
@@ -39,6 +40,40 @@ use crate::types::zones::Zone;
 /// CR 905: True when the object is a conspiracy card.
 pub fn is_conspiracy(obj: &GameObject) -> bool {
     obj.card_types.core_types.contains(&CoreType::Conspiracy)
+}
+
+/// CR 702.106a: True when the conspiracy card has the hidden-agenda keyword,
+/// which makes it start the game face down (CR 905.4a). The engine does not
+/// model hidden agenda as a `Keyword` variant (it grants no in-game ability of
+/// its own beyond the reveal special action), so this reads the reminder-text
+/// line every hidden-agenda conspiracy prints.
+/// CR 702.106f: double agenda is also a hidden-agenda variant.
+pub fn has_hidden_agenda(face: &CardFace) -> bool {
+    agenda_name_count(face) != 0
+}
+
+/// CR 702.106a/f: Hidden agenda names one card; double agenda names two.
+pub fn agenda_name_count(face: &CardFace) -> usize {
+    use nom::{branch::alt, bytes::complete::tag_no_case, combinator::value, Parser};
+    face.oracle_text.as_deref().map_or(0, |text| {
+        text.lines()
+            .find_map(|line| {
+                alt((
+                    value(
+                        1,
+                        tag_no_case::<_, _, nom::error::Error<&str>>("hidden agenda"),
+                    ),
+                    value(2, tag_no_case("double agenda")),
+                ))
+                .parse(line.trim())
+                .ok()
+                .and_then(|(rest, count)| {
+                    (rest.is_empty() || rest.starts_with(' ') || rest.starts_with('('))
+                        .then_some(count)
+                })
+            })
+            .unwrap_or(0)
+    })
 }
 
 /// CR 905.4 + CR 113.6b: True when this object is a conspiracy that is currently
@@ -122,13 +157,38 @@ pub fn start_with_conspiracy(state: &mut GameState, id: ObjectId, hidden_agenda:
 /// (CR 404.2 / CR 905.5: a conspiracy's owner is its controller). On success the
 /// conspiracy turns face up and begins functioning, so layers are marked dirty
 /// to gather its now-active command-zone statics (CR 611.2).
+pub fn can_reveal_hidden_agenda(state: &GameState, id: ObjectId, player: PlayerId) -> bool {
+    state.objects.get(&id).is_some_and(|obj| {
+        if obj.zone != Zone::Command || !obj.face_down || obj.owner != player || !is_conspiracy(obj)
+        {
+            return false;
+        }
+        // CR 702.106a/f: setup validates the number of commitments against
+        // this card's agenda ability. Reveal either one name or two distinct
+        // names, never an empty or malformed commitment.
+        let names: Vec<_> = obj
+            .chosen_attributes
+            .iter()
+            .filter_map(|choice| match choice {
+                crate::types::ability::ChosenAttribute::CardName(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        match names.as_slice() {
+            [name] => !name.is_empty(),
+            [first, second] => {
+                !first.is_empty() && !second.is_empty() && !first.eq_ignore_ascii_case(second)
+            }
+            _ => false,
+        }
+    })
+}
+
 pub fn turn_hidden_agenda_face_up(state: &mut GameState, id: ObjectId, player: PlayerId) -> bool {
-    let Some(obj) = state.objects.get_mut(&id) else {
-        return false;
-    };
-    if !(obj.zone == Zone::Command && obj.face_down && obj.owner == player && is_conspiracy(obj)) {
+    if !can_reveal_hidden_agenda(state, id, player) {
         return false;
     }
+    let obj = state.objects.get_mut(&id).unwrap();
     obj.face_down = false;
     crate::game::layers::mark_layers_full(state);
     true

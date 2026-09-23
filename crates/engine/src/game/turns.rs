@@ -96,6 +96,10 @@ pub fn advance_phase(state: &mut GameState, events: &mut Vec<GameEvent>) {
                 }
             },
             AdvancePhaseOnce::Skipped => {}
+            // CR 614.1b: the turn start parked on an optional `BeginTurn`
+            // replacement choice (Time Vault). `waiting_for` already holds the
+            // prompt; stop advancing until the player answers.
+            AdvancePhaseOnce::Paused => return,
         }
     }
 }
@@ -121,6 +125,9 @@ pub(in crate::game) enum PhaseEntryOutcome {
 pub(in crate::game) enum AdvancePhaseOnce {
     Entry(Box<PhaseEntryOutcome>),
     Skipped,
+    /// CR 614.1b: the turn start paused on an optional `BeginTurn` replacement
+    /// choice (Time Vault). `state.waiting_for` holds the prompt to surface.
+    Paused,
 }
 
 pub(in crate::game) fn advance_phase_once(
@@ -199,7 +206,11 @@ pub(in crate::game) fn advance_phase_once(
     // replacements (CR 614.10) are handled inside `start_next_turn` — the
     // per-phase pipeline below runs only for within-turn phase advances.
     if state.phase == Phase::Cleanup && next == Phase::Untap {
-        start_next_turn(state, events);
+        if start_next_turn(state, events) {
+            // CR 614.1b: optional BeginTurn replacement parked a choice; do not
+            // enter the untap step until the player answers.
+            return AdvancePhaseOnce::Paused;
+        }
     } else {
         // CR 614.1b + CR 614.10 + CR 500.11: Route phase/step starts through the
         // replacement pipeline so condition-gated skip replacements can prevent
@@ -1336,7 +1347,7 @@ pub fn projected_turn_order(state: &GameState, max_slots: usize) -> Vec<PlayerId
 }
 
 /// Begin the next player's turn (CR 500.1 / CR 101.4 seat order).
-pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
+pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) -> bool {
     assert!(
         state.stack.is_empty()
             && state.resolution_stack.is_empty()
@@ -1432,18 +1443,29 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
         ReplacementResult::Execute(_) => {
             // Normal path — turn proceeds.
         }
-        ReplacementResult::NeedsChoice(_) => {
-            // CR 614.1b: Skip replacements are mandatory — no Optional BeginTurn
-            // replacement should ever reach here. If a parser bug routes one here,
-            // clear the pending choice and proceed rather than stalling turn flow.
-            state.pending_replacement = None;
-            debug_assert!(
-                false,
-                "BeginTurn replacement unexpectedly returned NeedsChoice"
-            );
+        ReplacementResult::NeedsChoice(player) => {
+            // CR 614.1b: an OPTIONAL BeginTurn replacement (Time Vault) parks the
+            // accept/decline choice with the affected player. Surface it and pause
+            // the turn start; `resume_pending_begin_turn_choice` commits the turn
+            // on decline or skips it on accept once the player answers.
+            state.waiting_for = replacement::replacement_choice_waiting_for(player, state);
+            return true;
         }
     }
 
+    commit_begin_turn(state, events);
+    false
+}
+
+/// CR 500 + CR 614.1b: Commit the turn whose `BeginTurn` replacement pipeline
+/// settled on Execute (no skip). Shared by `start_next_turn` and the
+/// decline-resume path of an optional `BeginTurn` replacement (Time Vault).
+fn commit_begin_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
+    // CR 614.10a: the skipped-player index was computed for the `turns_to_skip`
+    // fast path before the BeginTurn replacement check; recompute it here because
+    // this body is shared with the resume path of an optional BeginTurn choice.
+    let skip_player = super::topology::normalize_shared_turn_recipient(state, state.active_player);
+    let idx = skip_player.0 as usize;
     // CR 500: Track per-player turn count for "your Nth turn of the game" conditions.
     state.players[state.active_player.0 as usize].turns_taken += 1;
     // CR 613.4a + CR 604.3: `turns_taken` is a layer-7a characteristic-defining
@@ -1719,6 +1741,52 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
         player_id: state.active_player,
         turn_number: state.turn_number,
     });
+}
+
+/// CR 614.1b: Resume a turn start parked on an optional `BeginTurn` replacement
+/// (Time Vault). `accepted` is true when the player applied the replacement
+/// (skip the turn); `source_id` is the replacement's source permanent, which the
+/// "If you do" rider untaps on accept. Returns the waiting state to surface.
+pub(in crate::game) fn resume_pending_begin_turn_choice(
+    state: &mut GameState,
+    accepted: bool,
+    source_id: Option<ObjectId>,
+    events: &mut Vec<GameEvent>,
+) -> WaitingFor {
+    if accepted {
+        // CR 614.1b + CR 614.1c: the "If you do" accept rider untaps the source,
+        // then the turn is skipped by continuing to the next player's turn start
+        // (mirrors the mandatory-skip recursion in `start_next_turn`).
+        if let Some(source_id) = source_id {
+            if state.objects.get(&source_id).is_some_and(|obj| obj.tapped) {
+                if let Some(obj) = state.objects.get_mut(&source_id) {
+                    obj.tapped = false;
+                }
+                events.push(GameEvent::PermanentUntapped {
+                    object_id: source_id,
+                });
+            }
+        }
+        state.waiting_for = WaitingFor::Priority {
+            player: state.active_player,
+        };
+        let _ = start_next_turn(state, events);
+        if matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+            state.waiting_for = WaitingFor::Priority {
+                player: state.priority_player,
+            };
+        }
+    } else {
+        // CR 614.1b: decline — the turn proceeds. The pre-replacement setup ran
+        // before the pause; commit the remainder and enter the untap step exactly
+        // as the non-paused `advance_phase_once` path would have.
+        commit_begin_turn(state, events);
+        state.waiting_for = WaitingFor::Priority {
+            player: state.priority_player,
+        };
+        let _ = enter_phase(state, Phase::Untap, events, None);
+    }
+    state.waiting_for.clone()
 }
 
 /// CR 502.1 + CR 502.3: During the untap step, first the phasing turn-based
@@ -3256,6 +3324,17 @@ fn auto_advance_once(state: &mut GameState, events: &mut Vec<GameEvent>) -> Auto
     // via the `EmptyManaPool` arm of `handle_replacement_choice`.
     if state.pending_phase_transition_progress.is_some() {
         state.deferred_step_trigger_resume = Some(state.phase);
+        return AutoAdvanceStep::waiting(state.waiting_for.clone());
+    }
+    // CR 614.1b: A turn start parked on an optional `BeginTurn` replacement
+    // (Time Vault). `start_next_turn` set `waiting_for` and `advance_phase_once`
+    // returned `Paused` without entering the untap step; re-surface the parked
+    // accept/decline prompt until the player answers.
+    if state
+        .pending_replacement
+        .as_ref()
+        .is_some_and(|pending| matches!(pending.proposed, ProposedEvent::BeginTurn { .. }))
+    {
         return AutoAdvanceStep::waiting(state.waiting_for.clone());
     }
 

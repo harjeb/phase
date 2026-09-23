@@ -183,6 +183,7 @@ fn server_hello_mode_byte_identical() {
         lobby_protocol_version: Some(lb::LOBBY_PROTOCOL_VERSION),
     };
     let sc_hello = sc::ServerMessage::ServerHello {
+        manabrew_version: None,
         server_version: "0.1.0".into(),
         build_commit: "abc".into(),
         protocol_version: sc::PROTOCOL_VERSION,

@@ -25558,11 +25558,10 @@ fn cant_cast_filter_matches_for(
         // has no top-level chosen-name variant, so match the spell name against
         // the source's chosen name here.
         TargetFilter::HasChosenName => {
-            let chosen_name = source_obj.chosen_attributes.iter().find_map(|a| match a {
-                ChosenAttribute::CardName(n) => Some(n.as_str()),
-                _ => None,
-            });
-            chosen_name.is_some_and(|name| name.eq_ignore_ascii_case(&spell_obj.name))
+            // CR 702.106f + CR 607.2d: consider every linked chosen name.
+            source_obj.chosen_attributes.iter().any(|choice| {
+                matches!(choice, ChosenAttribute::CardName(name) if name.eq_ignore_ascii_case(&spell_obj.name))
+            })
         }
         // Everything else — including IsChosenColor / IsChosenCardType properties —
         // flows through the shared source-aware typed-filter conjunction.

@@ -60,6 +60,9 @@ pub(crate) fn turn_face_up_offer(
     player: PlayerId,
     object_id: ObjectId,
 ) -> Option<TurnFaceUpOffer> {
+    if super::conspiracy::can_reveal_hidden_agenda(state, object_id, player) {
+        return Some(TurnFaceUpOffer::Ready);
+    }
     let (_, cost) = turn_face_up_prepare(state, object_id, player).ok()?;
     let cost = super::casting::apply_special_action_cost_reduction(
         state,
@@ -101,6 +104,7 @@ pub(in crate::game) fn priority_turn_face_up_candidates(
     state
         .battlefield
         .iter()
+        .chain(state.command_zone.iter())
         .copied()
         .filter_map(|object_id| {
             Some(match turn_face_up_offer(state, player, object_id)? {
@@ -519,6 +523,15 @@ pub(crate) fn handle_turn_face_up(
     announced_x: u32,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
+    // CR 702.106: revealing a named hidden agenda is a free special action.
+    // It is not a battlefield morph and does not pay a morph cost.
+    if super::conspiracy::can_reveal_hidden_agenda(state, object_id, player) {
+        if announced_x != 0 {
+            return Err(EngineError::InvalidAction("A conspiracy reveal has no X cost".into()));
+        }
+        super::conspiracy::turn_hidden_agenda_face_up(state, object_id, player);
+        return Ok(WaitingFor::Priority { player });
+    }
     // CR 116.2b: `turn_face_up_prepare` is the single legality and cost
     // authority, shared with the Priority offer enumeration.
     let (cost_source, cost) = turn_face_up_prepare(state, object_id, player)?;

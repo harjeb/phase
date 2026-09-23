@@ -306,7 +306,50 @@ impl DamageContext {
     /// Build context by reading keywords from the source object.
     /// Returns None if source doesn't exist in state.
     pub(crate) fn from_source(state: &GameState, source_id: ObjectId) -> Option<Self> {
-        state.objects.get(&source_id).map(|obj| Self {
+        let object = state.objects.get(&source_id)?;
+        Self::from_incarnation(
+            state,
+            crate::types::identifiers::ObjectIncarnationRef::from_object(object),
+        )
+    }
+
+    /// CR 400.7 + CR 702.15c: Frozen assignments retain their source's identity
+    /// and keyword characteristics even after that incarnation leaves play.
+    /// Ordinary noncombat callers continue to stamp the currently stored object.
+    pub(crate) fn from_incarnation(
+        state: &GameState,
+        source: crate::types::identifiers::ObjectIncarnationRef,
+    ) -> Option<Self> {
+        use crate::game::damage_source::{damage_source_view, DamageSourceView};
+        use crate::types::keywords::Keyword;
+
+        let source_id = source.object_id;
+        let obj = match damage_source_view(state, source)? {
+            DamageSourceView::Live(object) => object,
+            DamageSourceView::Lki(snapshot) => {
+                return Some(Self {
+                    source_id,
+                    source_incarnation: Some(source.incarnation),
+                    controller: snapshot.controller,
+                    source_is_creature: snapshot.card_types.contains(&CoreType::Creature),
+                    has_deathtouch: snapshot.keywords.contains(&Keyword::Deathtouch),
+                    has_lifelink: snapshot.keywords.contains(&Keyword::Lifelink),
+                    has_wither: snapshot.keywords.contains(&Keyword::Wither),
+                    has_infect: snapshot.keywords.contains(&Keyword::Infect),
+                    combat_damage_poison: snapshot
+                        .keywords
+                        .iter()
+                        .filter_map(|keyword| match keyword {
+                            Keyword::Toxic(amount) => Some(*amount),
+                            _ => None,
+                        })
+                        .sum(),
+                    excess_recipient: None,
+                    lifelink_bonus: 0,
+                });
+            }
+        };
+        Some(Self {
             source_id,
             source_incarnation: Some(obj.incarnation),
             controller: obj.controller,
@@ -457,7 +500,12 @@ pub(crate) fn pre_replacement_damage_gate(
 
     // CR 120.2: Source-side "can't deal damage" prohibition. The source deals
     // zero damage of any kind, regardless of target.
-    if crate::game::static_abilities::object_has_static_other(
+    if ctx.source_incarnation.is_none_or(|incarnation| {
+        state
+            .objects
+            .get(&ctx.source_id)
+            .is_some_and(|source| source.incarnation == incarnation)
+    }) && crate::game::static_abilities::object_has_static_other(
         state,
         ctx.source_id,
         "CantDealDamage",
@@ -477,13 +525,20 @@ pub(crate) fn pre_replacement_damage_gate(
         }
     }
 
-    // CR 702.16b + CR 702.16e: Protection prevents damage from sources with the matching quality.
+    // CR 400.7: A captured source cannot borrow the qualities of a later
+    // incarnation. Legacy/fallback contexts without a pin retain their live read.
+    let source = match ctx.source_incarnation {
+        Some(incarnation) => crate::game::damage_source::damage_source_view(
+            state,
+            crate::types::identifiers::ObjectIncarnationRef::of(ctx.source_id, incarnation),
+        ),
+        None => state.objects.get(&ctx.source_id).map(Into::into),
+    };
+
+    // CR 702.16e: Protection prevents damage from sources with the matching quality.
     // Emits DamagePrevented so "when damage is prevented" triggers can fire.
     if let TargetRef::Object(target_obj_id) = target {
-        if let (Some(target_obj), Some(source_obj)) = (
-            state.objects.get(target_obj_id),
-            state.objects.get(&ctx.source_id),
-        ) {
+        if let (Some(target_obj), Some(source_obj)) = (state.objects.get(target_obj_id), source) {
             if keywords::protection_prevents_from(target_obj, source_obj) {
                 events.push(GameEvent::DamagePrevented {
                     source_id: ctx.source_id,
@@ -500,11 +555,7 @@ pub(crate) fn pre_replacement_damage_gate(
     // protection gate above for player targets. Emits DamagePrevented so
     // prevention-triggered abilities still observe the event.
     if let TargetRef::Player(player_id) = target {
-        if crate::game::static_abilities::player_protection_from(
-            state,
-            *player_id,
-            Some(ctx.source_id),
-        ) {
+        if crate::game::static_abilities::player_protection_from_source(state, *player_id, source) {
             events.push(GameEvent::DamagePrevented {
                 source_id: ctx.source_id,
                 target: target.clone(),
@@ -880,7 +931,13 @@ pub(crate) fn apply_damage_after_replacement(
         // dealt combat damage by ~ or a Dragon this turn") evaluate against the
         // source as it was when the damage was dealt — the source may later
         // change type, leave the battlefield (CR 113.7a LKI), or be removed.
-        let src = state.objects.get(&ctx.source_id);
+        let src = match ctx.source_incarnation {
+            Some(incarnation) => crate::game::damage_source::damage_source_view(
+                state,
+                crate::types::identifiers::ObjectIncarnationRef::of(ctx.source_id, incarnation),
+            ),
+            None => state.objects.get(&ctx.source_id).map(Into::into),
+        };
         // CR 400.7: Use the incarnation captured with the damage context, not
         // a post-application live lookup. The latter can name a later object
         // after a replacement pause or zone change.
@@ -909,7 +966,7 @@ pub(crate) fn apply_damage_after_replacement(
             source_owner: ctx.controller,
             ..Default::default()
         };
-        if let Some(obj) = src {
+        if let Some(crate::game::damage_source::DamageSourceView::Live(obj)) = src {
             record.source_name = obj.name.clone();
             record.source_core_types = obj.card_types.core_types.clone();
             record.source_subtypes = obj.card_types.subtypes.clone();
@@ -931,6 +988,23 @@ pub(crate) fn apply_damage_after_replacement(
             // Battlefield for a permanent) so a zone-discriminating look-back
             // source filter evaluates against the zone as it was at damage time.
             record.source_zone = obj.zone;
+        } else if let Some(crate::game::damage_source::DamageSourceView::Lki(lki)) = src {
+            // A departed combat source still deals its assigned damage. Its
+            // history must describe that incarnation, not a returned object.
+            record.source_name = lki.name.clone();
+            record.source_core_types = lki.card_types.clone();
+            record.source_subtypes = lki.subtypes.clone();
+            record.source_supertypes = lki.supertypes.clone();
+            record.source_keywords = lki.keywords.clone();
+            record.source_power = lki.power;
+            record.source_toughness = lki.toughness;
+            record.source_colors = lki.colors.clone();
+            record.source_mana_value = lki.mana_value;
+            record.source_controller_snapshot = lki.controller;
+            record.source_owner = lki.owner;
+            if is_combat {
+                record.source_zone = crate::types::zones::Zone::Battlefield;
+            }
         }
         state.damage_dealt_this_turn.push_back(record);
         // CR 120.3 + CR 120.6 + CR 702.11b + CR 613.1f: Mark the source as having
@@ -943,11 +1017,12 @@ pub(crate) fn apply_damage_after_replacement(
         // `has_hexproof` reads — otherwise the conditional hexproof grant for
         // "has hexproof if it hasn't dealt damage yet" would never drop at the
         // targeting check (a Clean `layers_dirty` no-ops `flush_layers`).
-        if state
-            .objects
-            .get(&ctx.source_id)
-            .is_some_and(|obj| obj.zone == crate::types::zones::Zone::Battlefield)
-            && state.objects_that_dealt_damage.insert(ctx.source_id)
+        if state.objects.get(&ctx.source_id).is_some_and(|obj| {
+            obj.zone == crate::types::zones::Zone::Battlefield
+                && ctx
+                    .source_incarnation
+                    .is_none_or(|incarnation| incarnation == obj.incarnation)
+        }) && state.objects_that_dealt_damage.insert(ctx.source_id)
         {
             state.layers_dirty.mark_full();
         }

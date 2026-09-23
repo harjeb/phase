@@ -10,9 +10,9 @@
 //! `game::deck_validation` enforces today; it is a default rather than a
 //! declared axis, which is why it needs no entry in that list.
 //!
-//! [`swedish_old_school`] passes both gates and is nonetheless withheld, for
-//! the sourcing reason its own doc comment gives — a documentation blocker that
-//! no gate expresses.
+//! [`swedish_old_school`] remains withheld pending host printing-selection
+//! plumbing and gameplay acceptance. Its selected-printing policy is enforced
+//! independently of its name-level card pool.
 
 use serde::{Deserialize, Serialize};
 
@@ -170,10 +170,27 @@ pub enum AntePolicy {
     Enabled,
 }
 
-/// `Default` is every axis at its modern value — the rule set an Axis-A
-/// lobby save always declares (it models no historical paper ruleset), and the
-/// one `passes_legacy_axis_gate` accepts unconditionally. A non-default value
-/// is accepted only for an axis listed in `IMPLEMENTED_LEGACY_AXES`.
+/// Printing rules checked against a selected printing, never inferred from a
+/// card name's having appeared in a legal set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum HistoricalPrintingPolicy {
+    #[default]
+    Any,
+    /// The eight editions and English-only rule in the Swedish primary source.
+    SwedishOriginal,
+}
+
+/// Versioned card-text authority, independent of combat damage timing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum CardTextPolicy {
+    #[default]
+    Oracle,
+    ClassicMagic,
+}
+
+/// `Default` preserves modern gameplay and unrestricted printing selection.
+/// Non-default gameplay axes require `IMPLEMENTED_LEGACY_AXES`; printing
+/// restrictions instead require catalog-backed deck admission.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct LegacyRuleSet {
     pub mana_burn: ManaBurnPolicy,
@@ -189,6 +206,10 @@ pub struct LegacyRuleSet {
     /// attribute for the same reason.
     #[serde(default)]
     pub ante: AntePolicy,
+    #[serde(default)]
+    pub printing_policy: HistoricalPrintingPolicy,
+    #[serde(default)]
+    pub card_text: CardTextPolicy,
 }
 
 /// CR 903.3 (and the Tiny Leaders / Oathbreaker RC / Brawl deck-construction
@@ -401,6 +422,7 @@ pub enum ReprintPolicy {
 pub enum PrintingFidelity {
     NotApplicable,
     SetCodeApproximation,
+    SelectedPrinting,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -679,6 +701,7 @@ pub enum LegacyAxis {
     WishOutsideGameScope,
     LegendRuleScope,
     Ante,
+    ClassicCardText,
 }
 
 /// Axes of `LegacyRuleSet` the engine actually enforces at runtime. Empty in
@@ -726,6 +749,9 @@ fn declared_legacy_axes(rules: &LegacyRuleSet) -> Vec<LegacyAxis> {
     if rules.ante != AntePolicy::default() {
         axes.push(LegacyAxis::Ante);
     }
+    if rules.card_text == CardTextPolicy::ClassicMagic {
+        axes.push(LegacyAxis::ClassicCardText);
+    }
     axes
 }
 
@@ -761,11 +787,15 @@ pub fn passes_legacy_axis_gate(rules: &LegacyRuleSet) -> bool {
 /// Registration gate (b): `reprint_policy` presence must agree with
 /// `printing_fidelity`.
 pub fn passes_reprint_fidelity_gate(def: &CustomFormatDef) -> bool {
-    def.reprint_policy.is_some()
-        == matches!(
-            def.printing_fidelity,
-            PrintingFidelity::SetCodeApproximation
-        )
+    match def.printing_fidelity {
+        PrintingFidelity::NotApplicable => def.reprint_policy.is_none(),
+        PrintingFidelity::SetCodeApproximation => def.reprint_policy.is_some(),
+        PrintingFidelity::SelectedPrinting => {
+            def.reprint_policy == Some(ReprintPolicy::OriginalPrintingsOnly)
+                && def.rules.legality.legacy.printing_policy
+                    == HistoricalPrintingPolicy::SwedishOriginal
+        }
+    }
 }
 
 /// Registration gate (c): no bundled preset may claim
@@ -809,16 +839,13 @@ pub const SWEDISH_OLD_SCHOOL_ID: CustomFormatId = CustomFormatId(1);
 /// "Summer Magic", no banned cards at all, 25 restricted cards, and fully
 /// modern rules.
 ///
-/// **Constructed but deliberately NOT registered.** `custom_format_registry`
-/// does not list this def, per PLAN.md §7/§8: the format's reprint policy is
-/// CONTEXT.md Open item 6, unresolved. Re-fetching the primary source
-/// confirmed every other list here but yielded only "Only English versions
-/// are allowed in Oldschool" on reprints — the secondary "no Revised-or-later
-/// reprints" claim remains unconfirmed — so `reprint_policy` stays `None`
-/// ("no confirmed authored intent to declare", distinct from a lobby save's
-/// permanent `None`), `printing_fidelity` stays `NotApplicable` per the §1
-/// pairing rule, and the def stays out of the selectable list rather than
-/// shipping a label a future maintainer would inherit as fact.
+/// **Constructed but deliberately NOT registered.** The primary source lists
+/// eight legal editions and says "Only English versions are allowed". Its
+/// "Local variations" section calls extra reprint sets additions to these
+/// rules (verified directly from the complete source, not its page summary).
+/// We enforce that closed edition list against selected printing records.
+/// Name-only admission fails closed. Host printing-catalog/selection plumbing
+/// and the preset's remaining gameplay acceptance are still release gates.
 ///
 /// The empty `banned` list is real data, not a placeholder: Swedish Old
 /// School bans nothing, restricting instead. `legal_sets` is `Some(_)` — this
@@ -891,16 +918,19 @@ pub fn swedish_old_school() -> CustomFormatDef {
                 // The source mentions no mana burn, no damage on the stack, no
                 // pre-M10 Wish templating and no modified legend rule: Swedish
                 // Old School is an old card pool played under modern rules.
-                legacy: LegacyRuleSet::default(),
+                legacy: LegacyRuleSet {
+                    printing_policy: HistoricalPrintingPolicy::SwedishOriginal,
+                    ..LegacyRuleSet::default()
+                },
             },
         },
         label: "Swedish Old School 93/94".to_string(),
         short_label: "OSS".to_string(),
         description: "Alpha through The Dark (plus Summer Magic), nothing banned, 25 restricted \
-                      cards, modern rules"
+                      cards, modern rules; selected English printings from the eight listed sets only"
             .to_string(),
-        reprint_policy: None,
-        printing_fidelity: PrintingFidelity::NotApplicable,
+        reprint_policy: Some(ReprintPolicy::OriginalPrintingsOnly),
+        printing_fidelity: PrintingFidelity::SelectedPrinting,
     }
 }
 
@@ -1116,11 +1146,10 @@ pub fn bundled_presets() -> Vec<CustomFormatDef> {
 /// [`IMPLEMENTED_LEGACY_AXES`] released both without touching either
 /// constructor, which is exactly what listing-then-filtering was for.
 ///
-/// [`swedish_old_school`] is the exception, and is deliberately NOT in this
-/// list: it PASSES both gates, so listing it would register it, and CONTEXT.md
-/// Open item 6 (its unconfirmed reprint-policy metadata) blocks that
-/// separately. A documentation blocker has no gate to express it, so omission
-/// is the only mechanism — see that constructor.
+/// [`swedish_old_school`] deliberately remains outside this list until host
+/// printing-catalog/selection plumbing and gameplay acceptance are complete.
+/// Its engine printing validation is implemented; name-only admission rejects
+/// it rather than making an unsupported printing-fidelity claim.
 pub fn custom_format_registry() -> Vec<CustomFormatDef> {
     let presets = bundled_presets();
     assert_no_lobby_save_sentinel_collision(&presets);

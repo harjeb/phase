@@ -24,6 +24,11 @@ pub fn load_from_mtgjson(mtgjson_path: &Path) -> Result<CardDatabase, Box<dyn Er
     let mut layout_index: HashMap<String, crate::types::card::LayoutKind> = HashMap::new();
     let mut bracket_signals_by_name: HashMap<String, BracketSignals> = HashMap::new();
     let mut legalities = HashMap::new();
+    // Custom formats (CR 100.6 tournament card-pool rules) resolve a deck's
+    // legal pool from each card's set codes, so the AtomicCards `printings`
+    // list has to survive this loader. `from_export_entries` already keeps it;
+    // dropping it here made every custom format fail closed.
+    let mut printings_index: HashMap<String, Vec<String>> = HashMap::new();
     let errors: Vec<(PathBuf, String)> = Vec::new();
 
     for faces in atomic.data.values() {
@@ -82,6 +87,9 @@ pub fn load_from_mtgjson(mtgjson_path: &Path) -> Result<CardDatabase, Box<dyn Er
                     }
                 }
                 face_index.insert(key.clone(), face.clone());
+                if !source.printings.is_empty() {
+                    printings_index.insert(key.clone(), source.printings.clone());
+                }
                 if source.is_game_changer {
                     bracket_signals_by_name.insert(
                         key.clone(),
@@ -118,6 +126,9 @@ pub fn load_from_mtgjson(mtgjson_path: &Path) -> Result<CardDatabase, Box<dyn Er
             };
             cards.insert(key.clone(), rules);
             face_index.insert(key.clone(), face);
+            if !faces[0].printings.is_empty() {
+                printings_index.insert(key.clone(), faces[0].printings.clone());
+            }
             if faces[0].is_game_changer {
                 bracket_signals_by_name.insert(
                     key.clone(),
@@ -144,7 +155,7 @@ pub fn load_from_mtgjson(mtgjson_path: &Path) -> Result<CardDatabase, Box<dyn Er
         search_face_keys,
         layout_index,
         legalities,
-        printings_index: HashMap::new(),
+        printings_index,
         rulings_index: HashMap::new(),
         errors,
         bracket_lists: Default::default(),

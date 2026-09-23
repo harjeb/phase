@@ -360,6 +360,7 @@ fn encore_three_player_one_token_per_opponent_then_sacrificed_at_end_step() {
 #[test]
 fn real_encore_card_synthesizes_encore_ability() {
     let atomic = AtomicCard {
+        rarity: String::new(),
         name: "Coastline Marauders".to_string(),
         mana_cost: Some("{4}{R}".to_string()),
         colors: vec!["R".to_string()],

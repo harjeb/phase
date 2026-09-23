@@ -4,7 +4,12 @@ version.workspace = true
 edition = "2021"
 license.workspace = true
 
+[features]
+# Explicit opt-in: the adapter depends on AGPL-3.0-or-later ManaBrew protocol types.
+manabrew = ["dep:manabrew-compat"]
+
 [dependencies]
+manabrew-compat = { path = "../manabrew-compat", optional = true }
 draft-core = { path = "../draft-core" }
 engine = { path = "../engine", package = "phase-engine" }
 lobby-broker = { path = "../lobby-broker" }

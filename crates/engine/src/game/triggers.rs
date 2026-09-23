@@ -6176,48 +6176,76 @@ fn collect_pending_triggers_with_collection(
             }
         }
 
-        // CR 702.173a + CR 608.2i: Record the controller of any Assassin
-        // creature OR commander that just dealt combat damage to a player. The
-        // ledger is snapshot at damage-time per CR 608.2i ("looks back in
-        // time") — a source that later stops being an Assassin/commander does
-        // NOT invalidate the permission granted by this ledger entry. Read at
-        // cast preparation by `casting_variant_candidates` to surface
-        // `CastingVariant::Freerunning` for spells in hand.
-        if let GameEvent::DamageDealt {
+        // CR 400.7: queued combat damage belongs to its recorded incarnation,
+        // even if a different object now occupies the same id. Collection runs
+        // at completion of each damage batch, before another priority window:
+        // the newest matching record belongs to this batch. A parked lifelink
+        // choice retains that batch without allowing a new combat assignment.
+        // This is not a general identity lookup for arbitrarily replayed events.
+        let combat_damage_source = if let GameEvent::DamageDealt {
             source_id,
-            target: TargetRef::Player(_),
+            target: target @ TargetRef::Player(_),
+            amount,
             is_combat: true,
             ..
         } = event
         {
-            // This is event-global damage attribution, not a triggered-source
-            // read: snapshot the damage source at this event boundary before
-            // recording the independent casting-permission ledger.
-            if let Some(source_obj) = state.objects.get(source_id) {
-                let is_assassin_creature = source_obj
-                    .card_types
-                    .core_types
-                    .contains(&crate::types::card_type::CoreType::Creature)
-                    && source_obj
-                        .card_types
-                        .subtypes
-                        .iter()
-                        .any(|s| s == "Assassin");
-                let is_commander = source_obj.is_commander;
-                // CR 702.76a + CR 608.2i: snapshot the controller and the source's
-                // creature types AT DAMAGE TIME (LKI) before any later mutation.
-                let controller = source_obj.controller;
-                let source_subtypes = source_obj.card_types.subtypes.clone();
-                // CR 702.76a: record this source's creature types under its
-                // controller so Prowl can later check "had any of this spell's
-                // creature types". A source with no subtypes contributes nothing.
-                session.record_combat_damage_casting_permission(
-                    state,
-                    controller,
-                    is_assassin_creature || is_commander,
-                    source_subtypes,
-                );
-            }
+            let incarnation = state
+                .damage_dealt_this_turn
+                .iter()
+                .rev()
+                .find(|record| {
+                    record.source_id == *source_id
+                        && record.target == *target
+                        && record.amount == *amount
+                        && record.is_combat
+                })
+                .and_then(|record| record.source_incarnation)
+                .or_else(|| {
+                    state
+                        .objects
+                        .get(source_id)
+                        .map(|object| object.incarnation)
+                });
+            incarnation
+                .and_then(|incarnation| {
+                    super::damage_source::damage_source_view(
+                        state,
+                        crate::types::identifiers::ObjectIncarnationRef::of(
+                            *source_id,
+                            incarnation,
+                        ),
+                    )
+                })
+                .map(|source| {
+                    // CR 903.3: commander designation is retained across zone changes.
+                    let is_commander = state
+                        .objects
+                        .get(source_id)
+                        .is_some_and(|object| object.is_commander);
+                    (
+                        source.controller(),
+                        source
+                            .core_types()
+                            .contains(&crate::types::card_type::CoreType::Creature),
+                        source.subtypes().to_vec(),
+                        is_commander,
+                    )
+                })
+        } else {
+            None
+        };
+
+        // CR 702.173a + CR 702.76a: retain damage-time control and creature
+        // types for Freerunning and Prowl.
+        if let Some((controller, is_creature, ref subtypes, is_commander)) = combat_damage_source {
+            session.record_combat_damage_casting_permission(
+                state,
+                controller,
+                is_creature
+                    && (subtypes.iter().any(|subtype| subtype == "Assassin") || is_commander),
+                subtypes.clone(),
+            );
         }
 
         // CR 725.2: When a creature deals combat damage to the monarch, its controller
@@ -6230,9 +6258,7 @@ fn collect_pending_triggers_with_collection(
         } = event
         {
             if state.monarch == Some(*target_player) {
-                // The attacking creature's controller becomes the monarch
-                if let Some(attacker) = state.objects.get(source_id) {
-                    let new_monarch = attacker.controller;
+                if let Some((new_monarch, true, _, _)) = combat_damage_source {
                     if new_monarch != *target_player {
                         // CR 725.2: the synthetic trigger's controller IS the
                         // new monarch, so the printed-default subject axis is
@@ -6240,14 +6266,13 @@ fn collect_pending_triggers_with_collection(
                         let become_effect = Effect::BecomeMonarch {
                             target: TargetFilter::Controller,
                         };
-                        let source_context = trigger_source_context_for_latch(state, attacker);
-                        let mut become_ability = ResolvedAbility::new(
+                        // CR 725.2: this inherent trigger has no source.
+                        let become_ability = ResolvedAbility::new(
                             become_effect,
                             Vec::new(),
                             *source_id,
                             new_monarch,
                         );
-                        become_ability.set_trigger_source_recursive(source_context);
                         let trig_def = TriggerDefinition::new(TriggerMode::DamageDone)
                             .description("Monarch steal (CR 725.2)".to_string());
                         pending.push(PendingTriggerContext::single(PendingTrigger {
@@ -6282,17 +6307,16 @@ fn collect_pending_triggers_with_collection(
         } = event
         {
             if state.initiative == Some(*target_player) {
-                if let Some(attacker) = state.objects.get(source_id) {
-                    let new_holder = attacker.controller;
+                if let Some((new_holder, true, _, _)) = combat_damage_source {
                     if new_holder != *target_player {
-                        let source_context = trigger_source_context_for_latch(state, attacker);
-                        let mut take_init = ResolvedAbility::new(
+                        // Like monarch, this inherent game-rule trigger has no
+                        // source; a returned incarnation is not its controller.
+                        let take_init = ResolvedAbility::new(
                             Effect::TakeTheInitiative,
                             Vec::new(),
                             *source_id,
                             new_holder,
                         );
-                        take_init.set_trigger_source_recursive(source_context);
                         let trig_def = TriggerDefinition::new(TriggerMode::DamageDone)
                             .description("Initiative steal (CR 726.2)".to_string());
                         pending.push(PendingTriggerContext::single(PendingTrigger {

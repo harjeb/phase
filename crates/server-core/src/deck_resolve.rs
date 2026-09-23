@@ -86,6 +86,7 @@ pub fn resolve_deck(db: &CardDatabase, deck: &DeckData) -> Result<PlayerDeckPayl
 
     Ok(PlayerDeckPayload {
         main_deck,
+        conspiracy: Vec::new(),
         sideboard,
         commander,
         companion,

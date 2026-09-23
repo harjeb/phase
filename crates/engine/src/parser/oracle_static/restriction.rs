@@ -1363,6 +1363,43 @@ pub(crate) fn parse_cant_cast_type_spells(
 
     let trimmed = after_cant_cast.trim_end_matches('.');
 
+    // --- "[type] spells with mana value <comparator> <dynamic quantity>" ---
+    // CR 101.2 + CR 202.3: Lavinia, Azorius Renegade — "Each opponent can't
+    // cast noncreature spells with mana value greater than the number of lands
+    // that player controls." The type prefix is optional and the bound is a
+    // dynamic QuantityExpr resolved against the affected (casting) player at
+    // cast time (`SpellFilterContext::caster`). Tried before the fixed
+    // "spells with mana value N or less/greater" arm because that arm's `?`
+    // would abort the whole parse on a dynamic bound.
+    if let Some(marker) = trimmed.find(" spells with mana value ") {
+        let type_text = &trimmed[..marker];
+        let bound_text = &trimmed[marker + " spells with mana value ".len()..];
+        if let Some((comparator, qty_text)) = parse_mana_value_bound(bound_text) {
+            if let Some(qty) = parse_quantity_ref(qty_text.trim()) {
+                let type_filter = if type_text.is_empty() {
+                    Some(TypedFilter::default())
+                } else {
+                    match parse_type_phrase_folding(type_text) {
+                        (TargetFilter::Typed(tf), remainder) if remainder.trim().is_empty() => {
+                            Some(tf)
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(mut tf) = type_filter {
+                    tf.properties.push(FilterProp::Cmc {
+                        comparator,
+                        value: QuantityExpr::Ref { qty },
+                    });
+                    let def = StaticDefinition::new(StaticMode::CantBeCast { who })
+                        .affected(TargetFilter::Typed(tf))
+                        .description(text.to_string());
+                    return attach_parsed_static_gate(def, gate_condition_text);
+                }
+            }
+        }
+    }
+
     // --- "spells with mana value N or less/greater" ---
     if let Some(rest) = nom_tag_lower(trimmed, trimmed, "spells with mana value ") {
         return attach_parsed_static_gate(
@@ -1680,6 +1717,27 @@ pub(crate) fn parse_enchanted_controller_cant_cast(
         def = def.affected(filter);
     }
     Some(def)
+}
+
+/// Parse the comparator of a dynamic mana-value bound, e.g.
+/// "greater than the number of lands that player controls". Returns the
+/// `Comparator` and the remainder holding the quantity phrase.
+fn parse_mana_value_bound(rest: &str) -> Option<(Comparator, &str)> {
+    // Longest-match-first so "greater than or equal to " is preferred over
+    // the "greater than " prefix.
+    if let Some(after) = nom_tag_lower(rest, rest, "greater than or equal to ") {
+        return Some((Comparator::GE, after));
+    }
+    if let Some(after) = nom_tag_lower(rest, rest, "less than or equal to ") {
+        return Some((Comparator::LE, after));
+    }
+    if let Some(after) = nom_tag_lower(rest, rest, "greater than ") {
+        return Some((Comparator::GT, after));
+    }
+    if let Some(after) = nom_tag_lower(rest, rest, "less than ") {
+        return Some((Comparator::LT, after));
+    }
+    None
 }
 
 /// Parse "mana value N or less" / "mana value N or greater" from the remainder

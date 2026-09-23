@@ -316,6 +316,18 @@ fn handle_replacement_choice_inner(
     // pre-move incarnation and the exact proposed event. Capture this before
     // `continue_replacement` consumes the pending record.
     let parked_zone_change_delivery = state.pending_zone_change_delivery_from_replacement();
+    // CR 614.1b: an optional `BeginTurn` replacement (Time Vault) resumes a turn
+    // start instead of an event payload, so capture its proposed-event identity
+    // and winning source before `continue_replacement` consumes the pending
+    // record.
+    let parked_begin_turn = state
+        .pending_replacement
+        .as_ref()
+        .is_some_and(|pending| matches!(pending.proposed, ProposedEvent::BeginTurn { .. }));
+    let parked_begin_turn_source = state
+        .pending_replacement
+        .as_ref()
+        .and_then(|pending| pending.candidates.get(index).map(|rid| rid.source));
     let result = super::replacement::continue_replacement(state, index, events);
     // CR 614.12a: an optional `MayCost` accept whose payment surfaced an
     // interactive sub-choice (e.g. Mox Diamond's "discard a land card" with
@@ -328,6 +340,16 @@ fn handle_replacement_choice_inner(
     // delivered here.
     if std::mem::take(&mut state.replacement_may_cost_paused) {
         return Ok(state.waiting_for.clone());
+    }
+    // CR 614.1b: resolve the parked optional `BeginTurn` decision (Time Vault),
+    // then hand back to the turn state machine.
+    if parked_begin_turn {
+        return Ok(crate::game::turns::resume_pending_begin_turn_choice(
+            state,
+            matches!(result, super::replacement::ReplacementResult::Prevented),
+            parked_begin_turn_source,
+            events,
+        ));
     }
     match result {
         super::replacement::ReplacementResult::Execute(event) => {

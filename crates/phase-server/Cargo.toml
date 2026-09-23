@@ -36,6 +36,8 @@ url = "2"
 ngrok = { version = "0.18", optional = true }
 
 [features]
+# Explicit compatibility build; native protocol stays the default.
+manabrew = ["server-core/manabrew"]
 # Embed an ngrok tunnel so self-hosters can share a join code without
 # port-forwarding or TLS setup. Off by default (keeps the standard build lean);
 # enable in the Docker image with `--features ngrok` + NGROK_AUTHTOKEN.

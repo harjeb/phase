@@ -241,6 +241,7 @@ mod tests {
         atomic_data.insert(
             "Domesticated Mammoth".to_string(),
             vec![crate::database::mtgjson::AtomicCard {
+                rarity: String::new(),
                 name: "Domesticated Mammoth".to_string(),
                 mana_cost: None,
                 colors: vec![],
@@ -309,6 +310,7 @@ mod tests {
         atomic_data.insert(
             "Temple of Atropos".to_string(),
             vec![crate::database::mtgjson::AtomicCard {
+                rarity: String::new(),
                 name: "Temple of Atropos".to_string(),
                 mana_cost: None,
                 colors: vec![],
@@ -343,6 +345,7 @@ mod tests {
         atomic_data.insert(
             "Trial // Error".to_string(),
             vec![crate::database::mtgjson::AtomicCard {
+                rarity: String::new(),
                 name: "Trial // Error".to_string(),
                 mana_cost: None,
                 colors: vec![],

@@ -8638,6 +8638,9 @@ pub struct PlayerDeckPool {
     /// archenemy's pool carries the shared scheme deck.
     #[serde(default)]
     pub registered_scheme_deck: std::sync::Arc<Vec<DeckEntry>>,
+    /// Conspiracy slots retained for the next game's pregame setup.
+    #[serde(default)]
+    pub registered_conspiracy: std::sync::Arc<Vec<DeckEntry>>,
     #[serde(default)]
     pub current_scheme_deck: std::sync::Arc<Vec<DeckEntry>>,
     /// The declared bracket tier for this player's deck. Used by the AI to
@@ -17232,9 +17235,9 @@ pub enum StackEntryKind {
     /// rather than a bare `ObjectId`: dealing-time identity turns on whether the
     /// source or recipient is still the same object (CR 400.7).
     ///
-    /// RUNTIME: type-only in this phase — nothing constructs this variant in
-    /// production. It is pushed and resolved in the combat-damage-timing phase
-    /// that follows; see `docs/proposals/custom-format-engine/`.
+    /// RUNTIME: the gated `OnStack` combat path queues this variant and
+    /// `resolve_top` deals its frozen batch. Public format admission and saved
+    /// state admission remain disabled pending wider legacy-rules verification.
     CombatDamage {
         sub_step: CombatDamageSubStep,
         assignments: Vec<AssignedCombatDamage>,

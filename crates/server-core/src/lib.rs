@@ -18,6 +18,8 @@ pub mod legacy_deck_guard;
 pub mod legacy_join_guard;
 pub mod lobby;
 pub mod lobby_subscriber_wire_guard;
+#[cfg(feature = "manabrew")]
+pub mod manabrew;
 pub mod p2p_backup_guard;
 pub mod persist;
 pub mod protocol;

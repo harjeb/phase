@@ -238,7 +238,13 @@ fn turn_hidden_agenda_face_up_reveals_and_is_guarded() {
     assert!(!turn_hidden_agenda_face_up(&mut state, id, P1));
     assert!(state.objects.get(&id).unwrap().face_down);
 
-    // The controller can.
+    // A legacy setup without a pregame name cannot reveal.
+    assert!(!turn_hidden_agenda_face_up(&mut state, id, P0));
+    state.objects.get_mut(&id).unwrap().chosen_attributes.push(
+        crate::types::ability::ChosenAttribute::CardName("Grizzly Bears".into()),
+    );
+
+    // The controller can reveal the committed name.
     assert!(turn_hidden_agenda_face_up(&mut state, id, P0));
     assert!(!state.objects.get(&id).unwrap().face_down);
 

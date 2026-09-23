@@ -13471,6 +13471,31 @@ fn parse_event_substitution_replacement(
     norm_lower: &str,
     original_text: &str,
 ) -> Option<ReplacementDefinition> {
+    // CR 614.1b + CR 614.1c: Time Vault — "If you would begin your turn while
+    // ~ is tapped, you may skip that turn instead. If you do, untap ~." An
+    // OPTIONAL `BeginTurn` replacement gated on the source being tapped; the
+    // "If you do" accept branch (its `execute`) untaps the source, and the
+    // decline branch leaves the turn to proceed.
+    if nom_primitives::scan_contains(norm_lower, "would begin your turn while")
+        && nom_primitives::scan_contains(norm_lower, "you may skip that turn instead")
+    {
+        let untap = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::SetTapState {
+                target: TargetFilter::SelfRef,
+                scope: EffectScope::Single,
+                state: TapStateChange::Untap,
+            },
+        );
+        return Some(
+            ReplacementDefinition::new(ReplacementEvent::BeginTurn)
+                .condition(ReplacementCondition::SourceTappedState { tapped: true })
+                .mode(ReplacementMode::Optional { decline: None })
+                .execute(untap)
+                .description(original_text.to_string()),
+        );
+    }
+
     // CR 500.7 + CR 614.10: "would begin an extra turn" / "would take an extra turn"
     // — Stranglehold ("that player skips that turn instead") and similar.
     // `OnlyExtraTurn` gates the replacement to fire only for extra turns.

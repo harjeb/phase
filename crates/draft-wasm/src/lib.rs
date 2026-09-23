@@ -16,9 +16,10 @@ use draft_core::view::filter_for_player;
 use engine::database::CardDatabase;
 use phase_ai::config::AiDifficulty;
 
-mod bot_ai;
+// Pure helpers are shared by WASM and native Limited adapters.
+pub mod bot_ai;
 mod session_cell;
-mod suggest;
+pub mod suggest;
 
 use crate::session_cell::{with_draft, with_draft_inner, with_draft_mut, with_draft_mut_inner};
 

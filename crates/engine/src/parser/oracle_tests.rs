@@ -2766,6 +2766,7 @@ fn oracle_face_for(
 ) -> crate::types::card::CardFace {
     use crate::database::mtgjson::{AtomicCard, AtomicIdentifiers};
     let card = AtomicCard {
+        rarity: String::new(),
         name: name.to_string(),
         mana_cost: Some("{4}{B}".to_string()),
         colors: vec!["B".to_string()],
@@ -3282,6 +3283,7 @@ fn pupu_ufo_full_card_supported_dynamic_base_power() {
     // production sees.
     use crate::database::mtgjson::{AtomicCard, AtomicIdentifiers};
     let card = AtomicCard {
+        rarity: String::new(),
             name: "Pupu UFO".to_string(),
             mana_cost: Some("{3}{G}".to_string()),
             colors: vec!["G".to_string()],
@@ -3333,6 +3335,7 @@ fn pupu_ufo_full_card_supported_dynamic_base_power() {
 fn sita_varma_full_card_supported_inverted_genitive_base_pt() {
     use crate::database::mtgjson::{AtomicCard, AtomicIdentifiers};
     let card = AtomicCard {
+        rarity: String::new(),
             name: "Sita Varma, Masked Racer".to_string(),
             mana_cost: Some("{1}{G}{U}".to_string()),
             colors: vec!["G".to_string(), "U".to_string()],
@@ -27581,19 +27584,19 @@ fn parsed_effect_collectors_include_trigger_execution_trees() {
     );
 }
 
-/// CR 603.7a + CR 603.7c + CR 400.7: The impulse-cleanup sweep must stay HONESTLY
-/// unsupported. `demote_unbound_delayed_sweeps` replaces a delayed graveyard
-/// move whose swept objects were never bound to a concrete set with an
-/// `Effect::unimplemented`, because that shape provably strands the swept card
-/// (its `ParentTarget` resolves to the parent instruction's target — for
-/// Grinning Totem the targeted OPPONENT, not the exiled card) while the card
-/// would otherwise report as fully supported.
+/// CR 603.7a + CR 603.7c + CR 400.7: The impulse-cleanup sweep must BIND to the
+/// chain's tracked exile set, not stay honestly unsupported.
+/// `bind_unbound_delayed_sweeps` rewrites a delayed graveyard move whose swept
+/// objects were parsed as an unbound anaphor (`ParentTarget`/`Any`) to the
+/// tracked-set sentinel and marks the delayed trigger tracked-set-consuming, so
+/// `delayed_trigger::resolve` binds it to the exile set the preceding clause
+/// published (Glimpse the Impossible, Bank Job, Three Wishes, Grinning Totem).
 ///
-/// Three cards share the shape, so this is a class guard, not a card special
-/// case. Reverting the pass drops every key here and silently re-promotes all
-/// three to "supported".
+/// Three of these cards previously carried an honest
+/// `delayed_unplayed_exile_sweep` marker. Reverting the pass would re-introduce
+/// the marker and strand the swept cards in exile.
 #[test]
-fn unbound_delayed_graveyard_sweep_stays_honestly_unimplemented() {
+fn unbound_delayed_graveyard_sweep_binds_to_chain_tracked_set() {
     let cases = [
         (
             "Grinning Totem",
@@ -27611,12 +27614,22 @@ fn unbound_delayed_graveyard_sweep_stays_honestly_unimplemented() {
     for (name, text) in cases {
         let parsed = parse_oracle_text(text, name, &[], &[], &[]);
         assert!(
-            unimplemented_keys(&parsed)
+            !unimplemented_keys(&parsed)
                 .iter()
                 .any(|k| k == "delayed_unplayed_exile_sweep"),
-            "{name} must keep an honest `delayed_unplayed_exile_sweep` marker; \
-             keys={:?}",
+            "{name} must bind its impulse-cleanup sweep, not report \
+             `delayed_unplayed_exile_sweep`; keys={:?}",
             unimplemented_keys(&parsed),
+        );
+        assert!(
+            collect_all_effects(&parsed).iter().any(|effect| matches!(
+                effect,
+                Effect::CreateDelayedTrigger {
+                    uses_tracked_set: true,
+                    ..
+                }
+            )),
+            "{name} must mark its delayed graveyard sweep tracked-set-consuming"
         );
     }
 }

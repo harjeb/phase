@@ -1,6 +1,7 @@
-//! Phase 3a: `StackEntryKind::CombatDamage` exists, is classified as neither a
-//! spell nor an ability, and renders — while nothing constructs it in
-//! production.
+//! Combat-damage stack classification and the gated pre-M10 runtime.
+//!
+//! Admission remains refused until the legacy runtime's wider rules surface is
+//! verified. The runtime tests below opt in directly through FormatConfig.
 //!
 //! The rules premise is the pre-M10 procedure (Classic Sixth Edition 1999
 //! through Magic 2010, July 2009): all of a combat damage step's assignments go
@@ -9,19 +10,9 @@
 //! deliberately named only in prose — the current CR reuses 310 for Battles, so
 //! citing them as `CR` annotations would point at the wrong rule.
 //!
-//! Every entry here is hand-built. That is the point of the phase: the variant
-//! has no push authority yet, so a test is the only thing that can produce one.
-//!
-//! A restored state cannot seat one. An earlier revision left `resolve_top`
-//! panicking on this kind, reasoning that nothing constructs one — but the
-//! variant derives `Deserialize`, so a decoded `GameState` could seat one with
-//! no push authority anywhere, turning that `unreachable!` into a crash path.
-//! Resolving it off the stack as a no-op was worse: it would silently drop
-//! pending damage this build cannot deal. The refusal therefore lives at the
-//! persisted-admission boundary — `prepare_for_restore` rejects the kind
-//! outright — which leaves `resolve_top` unreachable on two independent
-//! grounds. Pinned by
-//! `persisted_admission_refuses_combat_damage_and_still_admits_ordinary_states`.
+//! Classification fixtures are hand-built; runtime fixtures below reach the
+//! real queue through combat actions. Persisted admission remains closed while
+//! the larger legacy-mode compatibility surface is unverified.
 
 use engine::game::derived_views::derive_views;
 use engine::game::effects::copy_spell;
@@ -37,6 +28,1217 @@ use engine::types::game_state::{
 use engine::types::identifiers::{ObjectId, ObjectIncarnationRef};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
+
+fn advance_to_queued_damage(
+    runner: &mut engine::game::scenario::GameRunner,
+    attacker: ObjectId,
+    blocker: ObjectId,
+) {
+    use engine::types::actions::GameAction;
+    let mut rules = engine::types::custom_format::old_school_93_94().rules;
+    rules.legality.legacy.damage_timing = engine::types::custom_format::CombatDamageTiming::OnStack;
+    rules.legality.legacy.mana_burn = Default::default();
+    runner.state_mut().format_config =
+        engine::types::format::FormatConfig::for_custom_rules(&rules);
+    runner.pass_both_players();
+    runner
+        .declare_attackers(&[(attacker, engine::game::combat::AttackTarget::Player(P1))])
+        .unwrap();
+    for _ in 0..12 {
+        if runner
+            .state()
+            .stack
+            .iter()
+            .any(|entry| matches!(entry.kind, StackEntryKind::CombatDamage { .. }))
+        {
+            assert_eq!(runner.state().phase, Phase::CombatDamage);
+            return;
+        }
+        match runner.state().waiting_for {
+            WaitingFor::DeclareBlockers { .. } => {
+                runner.declare_blockers(&[(blocker, attacker)]).unwrap();
+            }
+            WaitingFor::Priority { .. } => {
+                runner.act(GameAction::PassPriority).unwrap();
+            }
+            WaitingFor::AssignCombatDamage {
+                total_damage,
+                ref blockers,
+                ..
+            } => {
+                assert_eq!(blockers.len(), 1);
+                let lethal = blockers[0].lethal_minimum;
+                runner
+                    .act(GameAction::AssignCombatDamage {
+                        mode: Default::default(),
+                        assignments: vec![(blocker, lethal)],
+                        trample_damage: total_damage - lethal,
+                        controller_damage: 0,
+                    })
+                    .unwrap();
+            }
+            ref other => panic!("unexpected combat wait: {other:?}"),
+        }
+    }
+    panic!("combat never queued damage");
+}
+
+#[test]
+fn queued_damage_rejects_a_recipient_that_lost_all_damageable_types() {
+    use engine::types::card_type::CoreType;
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let attacker = scenario.add_vanilla(P0, 3, 4);
+    let blocker = scenario.add_vanilla(P1, 2, 4);
+    let mut runner = scenario.build();
+    advance_to_queued_damage(&mut runner, attacker, blocker);
+    let recipient = runner.state_mut().objects.get_mut(&blocker).unwrap();
+    recipient.card_types.core_types = vec![CoreType::Enchantment];
+    recipient.base_card_types.core_types = vec![CoreType::Enchantment];
+    runner.pass_both_players();
+    assert_eq!(runner.state().objects[&blocker].damage_marked, 0);
+    assert_eq!(
+        runner.state().objects[&attacker].damage_marked,
+        2,
+        "a source that stopped being a creature still deals its assignment"
+    );
+    assert!(!runner
+        .state()
+        .damage_dealt_this_turn
+        .iter()
+        .any(|record| record.source_id == attacker));
+}
+
+#[test]
+fn queued_damage_uses_current_lifelink_but_frozen_power() {
+    use engine::types::keywords::Keyword;
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let attacker = scenario.add_vanilla(P0, 3, 4);
+    let blocker = scenario.add_vanilla(P1, 2, 8);
+    let mut runner = scenario.build();
+    advance_to_queued_damage(&mut runner, attacker, blocker);
+    let source = runner.state_mut().objects.get_mut(&attacker).unwrap();
+    source.keywords.push(Keyword::Lifelink);
+    source.base_keywords.push(Keyword::Lifelink);
+    source.power = Some(7);
+    source.base_power = Some(7);
+    runner.pass_both_players();
+    assert_eq!(runner.state().objects[&blocker].damage_marked, 3);
+    assert_eq!(runner.life(P0), 23);
+}
+
+#[test]
+fn legacy_zero_and_negative_power_assign_zero_without_dealing_damage() {
+    use engine::game::combat::{AttackTarget, AttackerInfo, CombatState};
+    use engine::types::custom_format::CombatDamageTiming;
+    for timing in [CombatDamageTiming::OnStack, CombatDamageTiming::Modern] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::CombatDamage);
+        let zero = scenario.add_vanilla(P0, 0, 1);
+        let negative = scenario.add_vanilla(P0, -2, 1);
+        scenario.add_enchantment_from_oracle(
+            P0,
+            "Coastal Piracy",
+            "Whenever a creature you control deals combat damage to a player, you may draw a card.",
+        );
+        let mut runner = scenario.build();
+        let mut rules = engine::types::custom_format::old_school_93_94().rules;
+        rules.legality.legacy.damage_timing = timing;
+        runner.state_mut().format_config =
+            engine::types::format::FormatConfig::for_custom_rules(&rules);
+        let mut combat = CombatState::default();
+        for id in [zero, negative] {
+            combat.attackers.push(AttackerInfo {
+                object_id: id,
+                defending_player: P1,
+                attack_target: AttackTarget::Player(P1),
+                blocked: false,
+                band_id: None,
+            });
+        }
+        runner.state_mut().combat = Some(combat);
+        let mut events = Vec::new();
+        engine::game::combat_damage::resolve_combat_damage(runner.state_mut(), &mut events);
+        if timing == CombatDamageTiming::OnStack {
+            assert_eq!(runner.state().stack.len(), 1);
+            let StackEntryKind::CombatDamage { assignments, .. } = &runner.state().stack[0].kind
+            else {
+                panic!("missing damage object")
+            };
+            assert_eq!(assignments.len(), 2);
+            for id in [zero, negative] {
+                assert!(assignments
+                    .iter()
+                    .any(|a| a.source.object_id == id && a.amount == 0));
+            }
+            runner.pass_both_players();
+            assert!(matches!(
+                runner.state().waiting_for,
+                WaitingFor::Priority { .. }
+            ));
+        }
+        assert!(runner.state().stack.is_empty());
+        assert!(runner.state().damage_dealt_this_turn.is_empty());
+        assert_eq!(runner.life(P0), 20);
+        assert_eq!(runner.life(P1), 20);
+    }
+}
+
+#[test]
+fn empty_first_strike_still_queues_an_object_and_a_regular_step() {
+    use engine::game::combat::{AttackerInfo, CombatState};
+    use engine::types::keywords::Keyword;
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::CombatDamage);
+    let attacker = scenario
+        .add_creature(P0, "First striker", 3, 4)
+        .with_keyword(Keyword::FirstStrike)
+        .id();
+    let mut runner = scenario.build();
+    let mut rules = engine::types::custom_format::old_school_93_94().rules;
+    rules.legality.legacy.damage_timing = engine::types::custom_format::CombatDamageTiming::OnStack;
+    runner.state_mut().format_config =
+        engine::types::format::FormatConfig::for_custom_rules(&rules);
+    let mut combat = CombatState::default();
+    let mut info = AttackerInfo::attacking_player(attacker, P1);
+    info.blocked = true;
+    combat.attackers.push(info);
+    runner.state_mut().combat = Some(combat);
+    let mut events = Vec::new();
+    engine::game::combat_damage::resolve_combat_damage(runner.state_mut(), &mut events);
+    assert!(matches!(&runner.state().stack[0].kind,
+        StackEntryKind::CombatDamage { sub_step: CombatDamageSubStep::FirstStrike, assignments } if assignments.is_empty()));
+    runner.pass_both_players();
+    assert!(runner.state().stack.is_empty());
+    assert!(runner.state().combat.as_ref().unwrap().first_strike_done);
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { .. }
+    ));
+    runner.pass_both_players();
+    assert_eq!(runner.state().stack.len(), 1);
+    assert!(matches!(&runner.state().stack[0].kind,
+        StackEntryKind::CombatDamage { sub_step: CombatDamageSubStep::Regular, assignments } if assignments.is_empty()));
+    runner.pass_both_players();
+    assert_eq!(runner.life(P1), 20);
+    assert!(runner.state().combat.as_ref().unwrap().regular_damage_done);
+}
+
+#[test]
+fn queued_commander_damage_counts_after_a_zone_change() {
+    use engine::types::keywords::Keyword;
+    use engine::types::zones::Zone;
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let attacker = scenario
+        .add_creature(P0, "Commander", 3, 4)
+        .with_keyword(Keyword::Trample)
+        .id();
+    let blocker = scenario.add_vanilla(P1, 1, 1);
+    let mut runner = scenario.build();
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&attacker)
+        .unwrap()
+        .is_commander = true;
+    advance_to_queued_damage(&mut runner, attacker, blocker);
+    let mut events = Vec::new();
+    engine::game::zones::move_to_zone(runner.state_mut(), attacker, Zone::Graveyard, &mut events);
+    runner.pass_both_players();
+    assert_eq!(runner.life(P1), 18);
+    assert_eq!(runner.state().commander_damage.len(), 1);
+    assert_eq!(runner.state().commander_damage[0].damage, 2);
+}
+
+#[test]
+fn ending_turn_or_combat_clears_queued_damage_without_reassignment() {
+    use engine::types::actions::GameAction;
+    for text in ["End the turn.", "End the combat phase."] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let attacker = scenario.add_vanilla(P0, 3, 4);
+        let blocker = scenario.add_vanilla(P1, 2, 4);
+        let spell = scenario
+            .add_spell_to_hand(P0, "End phase", true)
+            .with_ability(if text == "End the turn." {
+                Effect::EndTheTurn
+            } else {
+                Effect::EndCombatPhase
+            })
+            .with_mana_cost(engine::types::mana::ManaCost::zero())
+            .id();
+        let mut runner = scenario.build();
+        advance_to_queued_damage(&mut runner, attacker, blocker);
+        runner.cast(spell).commit();
+        runner.act(GameAction::PassPriority).unwrap();
+        runner.act(GameAction::PassPriority).unwrap();
+        assert!(
+            runner.state().stack.is_empty(),
+            "{text}: stack {:?}, waiting {:?}",
+            runner.state().stack,
+            runner.state().waiting_for
+        );
+        assert!(runner.state().combat.is_none());
+        assert!(runner.state().pending_combat_lifelink.is_none());
+        assert_eq!(runner.state().objects[&attacker].damage_marked, 0);
+        assert_eq!(runner.state().objects[&blocker].damage_marked, 0);
+        for _ in 0..2 {
+            if matches!(runner.state().waiting_for, WaitingFor::Priority { .. }) {
+                runner.act(GameAction::PassPriority).unwrap();
+            }
+        }
+        assert!(!runner
+            .state()
+            .stack
+            .iter()
+            .any(|e| matches!(e.kind, StackEntryKind::CombatDamage { .. })));
+    }
+}
+
+#[test]
+fn observer_triggers_once_for_a_sacrificed_combat_source() {
+    use engine::types::keywords::Keyword;
+    use engine::types::zones::Zone;
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_enchantment_from_oracle(
+        P0,
+        "Coastal Piracy",
+        "Whenever a creature you control deals combat damage to a player, you may draw a card.",
+    );
+    let attacker = scenario
+        .add_creature(P0, "Trampler", 3, 4)
+        .with_keyword(Keyword::Trample)
+        .id();
+    let blocker = scenario.add_vanilla(P1, 1, 1);
+    let mut runner = scenario.build();
+    advance_to_queued_damage(&mut runner, attacker, blocker);
+    let mut events = Vec::new();
+    engine::game::zones::move_to_zone(runner.state_mut(), attacker, Zone::Graveyard, &mut events);
+    // A changed current object must not supply the old damage source's type.
+    let object = runner.state_mut().objects.get_mut(&attacker).unwrap();
+    object.card_types.core_types.clear();
+    object.base_card_types.core_types.clear();
+    runner.pass_both_players();
+    assert_eq!(runner.life(P1), 18);
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "the observer must see the sacrificed creature exactly once"
+    );
+    assert!(matches!(
+        runner.state().stack[0].kind,
+        StackEntryKind::TriggeredAbility { .. }
+    ));
+}
+
+#[test]
+fn protection_added_after_assignment_checks_a_sacrificed_sources_color() {
+    use engine::types::keywords::{Keyword, ProtectionTarget};
+    use engine::types::mana::ManaColor;
+    use engine::types::zones::Zone;
+    for color in [ManaColor::Red, ManaColor::Green] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let attacker = scenario
+            .add_creature(P0, "Colored source", 3, 4)
+            .with_color(vec![color])
+            .id();
+        let blocker = scenario.add_vanilla(P1, 2, 4);
+        let mut runner = scenario.build();
+        runner
+            .state_mut()
+            .objects
+            .get_mut(&attacker)
+            .unwrap()
+            .is_token = true;
+        advance_to_queued_damage(&mut runner, attacker, blocker);
+        let mut events = Vec::new();
+        engine::game::zones::move_to_zone(
+            runner.state_mut(),
+            attacker,
+            Zone::Graveyard,
+            &mut events,
+        );
+        let protection = Keyword::Protection(ProtectionTarget::Color(ManaColor::Red));
+        let recipient = runner.state_mut().objects.get_mut(&blocker).unwrap();
+        recipient.keywords.push(protection.clone());
+        recipient.base_keywords.push(protection);
+        runner.pass_both_players();
+        assert_eq!(
+            runner.state().objects[&blocker].damage_marked,
+            if color == ManaColor::Red { 0 } else { 3 }
+        );
+    }
+}
+
+#[test]
+fn eliminated_active_players_damage_object_survives_and_uses_lki() {
+    use engine::game::combat::{AttackerInfo, CombatState};
+    use engine::types::actions::GameAction;
+    use engine::types::keywords::Keyword;
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::CombatDamage);
+    let attacker = scenario
+        .add_creature(P0, "Departing lifelinker", 3, 4)
+        .with_keyword(Keyword::Lifelink)
+        .id();
+    let mut runner = scenario.build();
+    let mut rules = engine::types::custom_format::old_school_93_94().rules;
+    rules.legality.legacy.damage_timing = engine::types::custom_format::CombatDamageTiming::OnStack;
+    runner.state_mut().format_config =
+        engine::types::format::FormatConfig::for_custom_rules(&rules);
+    let mut combat = CombatState::default();
+    combat
+        .attackers
+        .push(AttackerInfo::attacking_player(attacker, P1));
+    runner.state_mut().combat = Some(combat);
+    let mut events = Vec::new();
+    engine::game::combat_damage::resolve_combat_damage(runner.state_mut(), &mut events);
+    runner.act(GameAction::Concede { player_id: P0 }).unwrap();
+    assert_eq!(runner.state().stack.len(), 1);
+    assert!(!runner
+        .state()
+        .objects
+        .get(&attacker)
+        .is_some_and(|object| object.zone == engine::types::zones::Zone::Battlefield));
+    let life_before = runner.life(P0);
+    for _ in 0..3 {
+        if runner.state().stack.is_empty() {
+            break;
+        }
+        runner.act(GameAction::PassPriority).unwrap();
+    }
+    assert!(runner.state().stack.is_empty());
+    assert_eq!(runner.life(P1), 17);
+    assert_eq!(
+        runner.life(P0),
+        life_before,
+        "departed controller gains no life"
+    );
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { player: P1 }
+    ));
+}
+
+#[test]
+fn beginning_step_triggers_are_above_damage_and_ordering_does_not_requeue() {
+    use engine::types::ability::{AbilityDefinition, AbilityKind, QuantityExpr, TriggerDefinition};
+    use engine::types::actions::GameAction;
+    use engine::types::triggers::TriggerMode;
+    for (count, inert) in [(1, false), (2, false), (2, true)] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let attacker = scenario.add_vanilla(P0, 3, 4);
+        let blocker = scenario.add_vanilla(P1, 2, 4);
+        for i in 0..count {
+            let trigger = TriggerDefinition::new(TriggerMode::Phase)
+                .phase(Phase::CombatDamage)
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::GainLife {
+                        amount: QuantityExpr::Fixed {
+                            value: i as i32 + 1,
+                        },
+                        player: TargetFilter::Controller,
+                    },
+                ));
+            scenario
+                .add_creature(P0, &format!("Step observer {i}"), 1, 4)
+                .with_trigger_definition(trigger);
+        }
+        let mut runner = scenario.build();
+        if count == 1 {
+            let object = runner.state_mut().objects.get_mut(&attacker).unwrap();
+            object
+                .keywords
+                .push(engine::types::keywords::Keyword::DoubleStrike);
+            object
+                .base_keywords
+                .push(engine::types::keywords::Keyword::DoubleStrike);
+        }
+        if inert {
+            // A step with no combatants is covered separately. Here effects
+            // explicitly prohibit assignment from both remaining combatants.
+            for id in [attacker, blocker] {
+                runner
+                    .state_mut()
+                    .objects
+                    .get_mut(&id)
+                    .unwrap()
+                    .assigns_no_combat_damage = true;
+            }
+        }
+        advance_to_queued_damage(&mut runner, attacker, blocker);
+        if count == 2 {
+            assert!(matches!(
+                runner.state().waiting_for,
+                WaitingFor::OrderTriggers { .. }
+            ));
+            runner
+                .act(GameAction::OrderTriggers { order: vec![0, 1] })
+                .unwrap();
+        }
+        assert_eq!(runner.state().stack.len(), count + 1);
+        assert!(matches!(
+            runner.state().stack[0].kind,
+            StackEntryKind::CombatDamage { .. }
+        ));
+        for _ in 0..count {
+            runner.pass_both_players();
+            assert_eq!(runner.state().objects[&blocker].damage_marked, 0);
+        }
+        assert_eq!(runner.life(P0), 20 + (count * (count + 1) / 2) as i32);
+        assert_eq!(runner.state().stack.len(), 1);
+        runner.pass_both_players();
+        assert!(
+            runner.state().stack.is_empty(),
+            "marker must not fire again at resolution"
+        );
+        assert_eq!(runner.life(P0), 20 + (count * (count + 1) / 2) as i32);
+        if count == 1 {
+            runner.pass_both_players();
+            assert_eq!(
+                runner.state().stack.len(),
+                1,
+                "the regular sub-step must not duplicate the beginning-step marker"
+            );
+            assert!(matches!(
+                runner.state().stack[0].kind,
+                StackEntryKind::CombatDamage {
+                    sub_step: CombatDamageSubStep::Regular,
+                    ..
+                }
+            ));
+            runner.pass_both_players();
+            assert_eq!(runner.life(P0), 21);
+        }
+    }
+}
+
+#[test]
+fn queued_damage_allows_a_real_bounce_response_and_still_deals_from_lki() {
+    use engine::types::zones::Zone;
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let attacker = scenario.add_vanilla(P0, 3, 4);
+    let blocker = scenario.add_vanilla(P1, 2, 4);
+    let bounce = scenario
+        .add_spell_to_hand_from_oracle(
+            P0,
+            "Test bounce",
+            true,
+            "Return target creature to its owner's hand.",
+        )
+        .with_mana_cost(engine::types::mana::ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    advance_to_queued_damage(&mut runner, attacker, blocker);
+    assert_eq!(runner.state().objects[&attacker].damage_marked, 0);
+    assert_eq!(runner.state().objects[&blocker].damage_marked, 0);
+    assert_eq!(runner.state().stack.len(), 1);
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { player: P0 }
+    ));
+    runner.cast(bounce).target_object(attacker).commit();
+    assert_eq!(runner.state().stack.len(), 2);
+    runner.pass_both_players();
+    assert_eq!(runner.state().objects[&attacker].zone, Zone::Hand);
+    assert_eq!(runner.state().objects[&blocker].damage_marked, 0);
+    assert_eq!(runner.state().stack.len(), 1);
+    runner.pass_both_players();
+    assert_eq!(runner.state().objects[&blocker].damage_marked, 3);
+    assert_eq!(runner.state().objects[&attacker].damage_marked, 0);
+    assert!(runner.state().stack.is_empty());
+}
+
+#[test]
+fn queued_damage_uses_original_source_lki_and_skips_returned_recipient() {
+    use engine::types::keywords::Keyword;
+    use engine::types::zones::Zone;
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let attacker = scenario
+        .add_creature(P0, "Lifelink attacker", 3, 4)
+        .with_keyword(Keyword::Lifelink)
+        .id();
+    let blocker = scenario.add_vanilla(P1, 2, 4);
+    let mut runner = scenario.build();
+    advance_to_queued_damage(&mut runner, attacker, blocker);
+    let original = runner.state().objects[&attacker].incarnation;
+    let mut events = Vec::new();
+    engine::game::zones::move_to_zone(runner.state_mut(), attacker, Zone::Hand, &mut events);
+    engine::game::zones::move_to_zone(runner.state_mut(), attacker, Zone::Battlefield, &mut events);
+    let returned = runner.state_mut().objects.get_mut(&attacker).unwrap();
+    assert_ne!(returned.incarnation, original);
+    returned.keywords.clear();
+    returned.base_keywords.clear();
+    returned.controller = P1;
+    returned.power = Some(9);
+    runner.pass_both_players();
+    assert_eq!(
+        runner.state().objects[&blocker].damage_marked,
+        3,
+        "amount is frozen"
+    );
+    assert_eq!(
+        runner.state().objects[&attacker].damage_marked,
+        0,
+        "old recipient has left"
+    );
+    assert_eq!(
+        runner.life(P0),
+        23,
+        "old source's lifelink controller is read from LKI"
+    );
+    assert_eq!(runner.life(P1), 20);
+    let record = runner
+        .state()
+        .damage_dealt_this_turn
+        .iter()
+        .find(|record| record.source_id == attacker)
+        .unwrap();
+    assert_eq!(record.source_incarnation, Some(original));
+    assert_eq!(record.source_power, Some(3));
+    assert_eq!(record.source_controller_snapshot, P0);
+    assert!(record.source_keywords.contains(&Keyword::Lifelink));
+    assert!(
+        !runner.state().objects_that_dealt_damage.contains(&attacker),
+        "the returned creature did not deal the old incarnation's damage"
+    );
+}
+
+#[test]
+fn queued_player_damage_credits_old_incarnation_for_casting_permissions_and_monarch() {
+    use engine::types::keywords::Keyword;
+    use engine::types::zones::Zone;
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let attacker = scenario
+        .add_creature(P0, "Assassin attacker", 3, 4)
+        .with_subtypes(vec!["Assassin"])
+        .with_keyword(Keyword::Trample)
+        .id();
+    let blocker = scenario.add_vanilla(P1, 1, 1);
+    let mut runner = scenario.build();
+    runner.state_mut().monarch = Some(P1);
+    advance_to_queued_damage(&mut runner, attacker, blocker);
+    let original = runner.state().objects[&attacker].incarnation;
+    let mut events = Vec::new();
+    engine::game::zones::move_to_zone(runner.state_mut(), attacker, Zone::Hand, &mut events);
+    engine::game::zones::move_to_zone(runner.state_mut(), attacker, Zone::Battlefield, &mut events);
+    let returned = runner.state_mut().objects.get_mut(&attacker).unwrap();
+    assert_ne!(returned.incarnation, original);
+    returned.controller = P1;
+    returned.card_types.subtypes = vec!["Goblin".into()];
+    returned.base_card_types.subtypes = vec!["Goblin".into()];
+    runner.pass_both_players();
+    assert_eq!(
+        runner.life(P1),
+        18,
+        "queued trample damage reached the monarch"
+    );
+    assert!(runner
+        .state()
+        .assassin_or_commander_dealt_combat_damage_this_turn
+        .contains(&P0));
+    assert!(!runner
+        .state()
+        .assassin_or_commander_dealt_combat_damage_this_turn
+        .contains(&P1));
+    assert!(runner
+        .state()
+        .creature_types_dealt_combat_damage_this_turn
+        .contains(&(P0, "Assassin".into())));
+    assert!(!runner
+        .state()
+        .creature_types_dealt_combat_damage_this_turn
+        .contains(&(P1, "Goblin".into())));
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "the old controller's monarch trigger was collected"
+    );
+    runner.pass_both_players();
+    assert_eq!(runner.state().monarch, Some(P0));
+}
+
+#[test]
+fn queued_player_damage_credits_old_incarnation_for_initiative() {
+    use engine::types::keywords::Keyword;
+    use engine::types::zones::Zone;
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let attacker = scenario
+        .add_creature(P0, "Trampler", 3, 4)
+        .with_keyword(Keyword::Trample)
+        .id();
+    let blocker = scenario.add_vanilla(P1, 1, 1);
+    let mut runner = scenario.build();
+    runner.state_mut().initiative = Some(P1);
+    advance_to_queued_damage(&mut runner, attacker, blocker);
+    let mut events = Vec::new();
+    engine::game::zones::move_to_zone(runner.state_mut(), attacker, Zone::Hand, &mut events);
+    engine::game::zones::move_to_zone(runner.state_mut(), attacker, Zone::Battlefield, &mut events);
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&attacker)
+        .unwrap()
+        .controller = P1;
+    runner.pass_both_players();
+    assert_eq!(runner.life(P1), 18);
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "initiative is collected exactly once"
+    );
+    assert_eq!(runner.state().stack.back().unwrap().controller, P0);
+    runner.pass_both_players();
+    assert_eq!(runner.state().initiative, Some(P0));
+}
+
+#[test]
+fn queued_lifelink_replacement_resumes_once_and_finishes_damage() {
+    check_queued_lifelink_replacement(false);
+}
+
+#[test]
+fn queued_lifelink_keeps_owed_gain_when_source_leaves_during_choice() {
+    check_queued_lifelink_replacement(true);
+}
+
+fn check_queued_lifelink_replacement(source_leaves_during_choice: bool) {
+    use engine::types::Zone;
+    use engine::types::ability::{
+        AbilityDefinition, AbilityKind, QuantityExpr, QuantityRef, ReplacementDefinition,
+    };
+    use engine::types::actions::GameAction;
+    use engine::types::counter::CounterType;
+    use engine::types::keywords::Keyword;
+    use engine::types::replacements::ReplacementEvent;
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let attacker = scenario
+        .add_creature(P0, "Lifelinker", 3, 4)
+        .with_keyword(Keyword::Lifelink)
+        .id();
+    let blocker = scenario.add_vanilla(P1, 1, 4);
+    let observer = scenario
+        .add_creature_from_oracle(
+            P0,
+            "Ajani's Pridemate",
+            2,
+            2,
+            "Whenever you gain life, put a +1/+1 counter on this creature.",
+        )
+        .id();
+    for (name, amount) in [
+        (
+            "Double gain",
+            QuantityExpr::Multiply {
+                factor: 2,
+                inner: Box::new(QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                }),
+            },
+        ),
+        (
+            "Extra gain",
+            QuantityExpr::Offset {
+                offset: 1,
+                inner: Box::new(QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                }),
+            },
+        ),
+    ] {
+        scenario
+            .add_creature(P0, name, 1, 5)
+            .with_replacement_definition(
+                ReplacementDefinition::new(ReplacementEvent::GainLife).execute(
+                    AbilityDefinition::new(
+                        AbilityKind::Spell,
+                        Effect::GainLife {
+                            amount,
+                            player: TargetFilter::Controller,
+                        },
+                    ),
+                ),
+            );
+    }
+    let mut runner = scenario.build();
+    advance_to_queued_damage(&mut runner, attacker, blocker);
+    runner.pass_both_players();
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::ReplacementChoice { .. }
+    ));
+    assert!(runner.state().pending_combat_lifelink.is_some());
+    assert!(!runner.state().combat.as_ref().unwrap().regular_damage_done);
+    assert_eq!(runner.life(P0), 20);
+    assert_eq!(runner.state().objects[&blocker].damage_marked, 3);
+    assert_eq!(runner.state().objects[&attacker].damage_marked, 1);
+    assert!(runner.state().stack.is_empty());
+    if source_leaves_during_choice {
+        // The forced replacement window has no priority; simulate a zone-change
+        // effect at this continuation boundary to test the parked obligation.
+        let mut events = Vec::new();
+        engine::game::zones::move_to_zone(runner.state_mut(), attacker, Zone::Hand, &mut events);
+    }
+    for _ in 0..4 {
+        if !matches!(
+            runner.state().waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ) {
+            break;
+        }
+        runner
+            .act(GameAction::ChooseReplacement { index: 0 })
+            .unwrap();
+    }
+    assert!(runner.state().pending_combat_lifelink.is_none());
+    assert!(runner.state().combat.as_ref().unwrap().regular_damage_done);
+    assert!(
+        [27, 28].contains(&runner.life(P0)),
+        "both legal replacement orders apply"
+    );
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "one life gain produces one observer trigger"
+    );
+    runner.pass_both_players();
+    assert_eq!(
+        runner.state().objects[&observer]
+            .counters
+            .get(&CounterType::Plus1Plus1),
+        Some(&1)
+    );
+    assert_eq!(runner.state().objects[&blocker].damage_marked, 3);
+    if !source_leaves_during_choice {
+        assert_eq!(runner.state().objects[&attacker].damage_marked, 1);
+    }
+    assert_eq!(
+        runner.state().objects[&attacker].zone,
+        if source_leaves_during_choice {
+            Zone::Hand
+        } else {
+            Zone::Battlefield
+        }
+    );
+    assert!(runner.state().stack.is_empty());
+    assert!(runner
+        .act(GameAction::ChooseReplacement { index: 0 })
+        .is_err());
+}
+
+#[test]
+fn stacked_double_strike_has_separate_assignment_and_priority_windows() {
+    use engine::types::keywords::Keyword;
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let attacker = scenario
+        .add_creature(P0, "Double strike attacker", 2, 6)
+        .with_keyword(Keyword::DoubleStrike)
+        .id();
+    let blocker = scenario.add_vanilla(P1, 1, 6);
+    let mut runner = scenario.build();
+    advance_to_queued_damage(&mut runner, attacker, blocker);
+    assert!(matches!(
+        runner.state().stack.back().unwrap().kind,
+        StackEntryKind::CombatDamage {
+            sub_step: CombatDamageSubStep::FirstStrike,
+            ..
+        }
+    ));
+    runner.pass_both_players();
+    assert_eq!(runner.state().objects[&blocker].damage_marked, 2);
+    assert_eq!(runner.state().objects[&attacker].damage_marked, 0);
+    assert!(runner.state().stack.is_empty());
+    assert!(runner.state().combat.as_ref().unwrap().first_strike_done);
+    assert!(!runner.state().combat.as_ref().unwrap().regular_damage_done);
+    runner.pass_both_players();
+    assert!(matches!(
+        runner.state().stack.back().unwrap().kind,
+        StackEntryKind::CombatDamage {
+            sub_step: CombatDamageSubStep::Regular,
+            ..
+        }
+    ));
+    assert_eq!(runner.state().objects[&blocker].damage_marked, 2);
+    runner.pass_both_players();
+    assert_eq!(runner.state().objects[&blocker].damage_marked, 4);
+    assert_eq!(runner.state().objects[&attacker].damage_marked, 1);
+    assert!(runner.state().combat.as_ref().unwrap().regular_damage_done);
+}
+
+#[test]
+fn first_strike_lifelink_choice_resumes_to_priority_before_regular_object() {
+    use engine::types::ability::{
+        AbilityDefinition, AbilityKind, QuantityExpr, QuantityRef, ReplacementDefinition,
+    };
+    use engine::types::actions::GameAction;
+    use engine::types::keywords::Keyword;
+    use engine::types::replacements::ReplacementEvent;
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let attacker = scenario
+        .add_creature(P0, "First strike lifelinker", 3, 6)
+        .with_keyword(Keyword::FirstStrike)
+        .with_keyword(Keyword::Lifelink)
+        .id();
+    let blocker = scenario.add_vanilla(P1, 2, 6);
+    for (name, amount) in [
+        (
+            "Double",
+            QuantityExpr::Multiply {
+                factor: 2,
+                inner: Box::new(QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                }),
+            },
+        ),
+        (
+            "Extra",
+            QuantityExpr::Offset {
+                offset: 1,
+                inner: Box::new(QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                }),
+            },
+        ),
+    ] {
+        scenario
+            .add_creature(P0, name, 1, 5)
+            .with_replacement_definition(
+                ReplacementDefinition::new(ReplacementEvent::GainLife).execute(
+                    AbilityDefinition::new(
+                        AbilityKind::Spell,
+                        Effect::GainLife {
+                            amount,
+                            player: TargetFilter::Controller,
+                        },
+                    ),
+                ),
+            );
+    }
+    let mut runner = scenario.build();
+    advance_to_queued_damage(&mut runner, attacker, blocker);
+    for _ in 0..2 {
+        runner.act(GameAction::PassPriority).unwrap();
+    }
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::ReplacementChoice { .. }
+    ));
+    assert!(runner.state().pending_combat_lifelink.is_some());
+    for _ in 0..4 {
+        if !matches!(
+            runner.state().waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ) {
+            break;
+        }
+        runner
+            .act(GameAction::ChooseReplacement { index: 0 })
+            .unwrap();
+    }
+    assert!(runner.state().pending_combat_lifelink.is_none());
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { player: P0 }
+    ));
+    assert!(runner.state().stack.is_empty());
+    assert!([27, 28].contains(&runner.life(P0)));
+    assert_eq!(runner.state().objects[&attacker].damage_marked, 0);
+    assert_eq!(runner.state().objects[&blocker].damage_marked, 3);
+    for _ in 0..2 {
+        runner.act(GameAction::PassPriority).unwrap();
+    }
+    assert!(matches!(
+        runner.state().stack.back().unwrap().kind,
+        StackEntryKind::CombatDamage {
+            sub_step: CombatDamageSubStep::Regular,
+            ..
+        }
+    ));
+    for _ in 0..2 {
+        runner.act(GameAction::PassPriority).unwrap();
+    }
+    assert_eq!(runner.state().objects[&attacker].damage_marked, 2);
+    assert_eq!(runner.state().objects[&blocker].damage_marked, 3);
+}
+
+#[test]
+fn combat_push_and_resolution_action_replay_reproduces_state_and_journal() {
+    use engine::types::actions::GameAction;
+    use engine::types::resolved_commands::ResolvedRulesCommand;
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let attacker = scenario.add_vanilla(P0, 3, 4);
+    let blocker = scenario.add_vanilla(P1, 2, 4);
+    let mut original = scenario.build();
+    let mut replay = engine::game::scenario::GameRunner::from_state(original.state().clone());
+    advance_to_queued_damage(&mut original, attacker, blocker);
+    advance_to_queued_damage(&mut replay, attacker, blocker);
+    let push = original
+        .state()
+        .resolved_rules_journal
+        .entries()
+        .iter()
+        .find_map(|entry| match &entry.command {
+            Some(ResolvedRulesCommand::StackPush(command))
+                if matches!(command.entry.kind, StackEntryKind::CombatDamage { .. }) =>
+            {
+                Some(command)
+            }
+            _ => None,
+        })
+        .expect("combat push must be journaled");
+    let encoded = serde_json::to_string(push).unwrap();
+    let push = serde_json::from_str(&encoded).unwrap();
+    replay.state_mut().stack.pop_back();
+    engine::game::stack::apply_resolved_stack_push(replay.state_mut(), &push).unwrap();
+    assert_eq!(
+        serde_json::to_value(original.state()).unwrap(),
+        serde_json::to_value(replay.state()).unwrap()
+    );
+    for _ in 0..2 {
+        let recorded = serde_json::to_string(&GameAction::PassPriority).unwrap();
+        original.act(GameAction::PassPriority).unwrap();
+        replay
+            .act(serde_json::from_str(&recorded).unwrap())
+            .unwrap();
+    }
+    assert!(original.state().stack.is_empty());
+    assert_eq!(original.state().objects[&blocker].damage_marked, 3);
+    assert_eq!(
+        serde_json::to_value(original.state()).unwrap(),
+        serde_json::to_value(replay.state()).unwrap()
+    );
+}
+
+#[test]
+fn queued_recipient_removed_from_combat_still_receives_damage() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let attacker = scenario.add_vanilla(P0, 3, 4);
+    let blocker = scenario.add_vanilla(P1, 2, 4);
+    let mut runner = scenario.build();
+    advance_to_queued_damage(&mut runner, attacker, blocker);
+    engine::game::effects::remove_from_combat::remove_object_from_combat(
+        runner.state_mut(),
+        blocker,
+    );
+    runner.pass_both_players();
+    assert_eq!(runner.state().objects[&blocker].damage_marked, 3);
+    assert_eq!(runner.state().objects[&attacker].damage_marked, 2);
+}
+
+#[test]
+fn eliminated_recipient_drops_only_their_assignments_and_priority_is_apnap() {
+    use engine::game::combat::{AttackerInfo, CombatState};
+    use engine::types::actions::GameAction;
+    let p2 = PlayerId(2);
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::CombatDamage);
+    let first = scenario.add_vanilla(P0, 3, 4);
+    let second = scenario.add_vanilla(P0, 2, 4);
+    let mut runner = scenario.build();
+    let mut rules = engine::types::custom_format::old_school_93_94().rules;
+    rules.legality.legacy.damage_timing = engine::types::custom_format::CombatDamageTiming::OnStack;
+    runner.state_mut().format_config =
+        engine::types::format::FormatConfig::for_custom_rules(&rules);
+    let mut combat = CombatState::default();
+    combat
+        .attackers
+        .push(AttackerInfo::attacking_player(first, P1));
+    combat
+        .attackers
+        .push(AttackerInfo::attacking_player(second, p2));
+    runner.state_mut().combat = Some(combat);
+    engine::game::combat_damage::resolve_combat_damage(runner.state_mut(), &mut Vec::new());
+    for player in [P0, P1, p2] {
+        assert!(
+            matches!(runner.state().waiting_for, WaitingFor::Priority { player: actual } if actual == player)
+        );
+        if player != p2 {
+            runner.act(GameAction::PassPriority).unwrap();
+        }
+    }
+    runner.act(GameAction::Concede { player_id: P1 }).unwrap();
+    assert_eq!(runner.state().stack.len(), 1);
+    let departed_life = runner.life(P1);
+    for _ in 0..3 {
+        if runner.state().stack.is_empty() {
+            break;
+        }
+        runner.act(GameAction::PassPriority).unwrap();
+    }
+    assert!(runner.state().stack.is_empty());
+    assert_eq!(runner.life(P1), departed_life);
+    assert_eq!(runner.life(p2), 18);
+    assert!(!runner
+        .state()
+        .damage_dealt_this_turn
+        .iter()
+        .any(|record| record.source_id == first));
+}
+
+#[test]
+fn eliminated_controller_returns_stolen_combatant_for_live_damage() {
+    use engine::types::ability::{ContinuousModification, Duration};
+    use engine::types::actions::GameAction;
+    use engine::types::keywords::Keyword;
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    let attacker = scenario
+        .add_creature(PlayerId(2), "Stolen lifelinker", 3, 6)
+        .with_keyword(Keyword::Lifelink)
+        .id();
+    let blocker = scenario.add_vanilla(P1, 2, 6);
+    let thief = scenario.add_vanilla(P0, 1, 1);
+    let mut runner = scenario.build();
+    runner.state_mut().add_transient_continuous_effect(
+        thief,
+        P0,
+        Duration::Permanent,
+        TargetFilter::SpecificObject { id: attacker },
+        vec![ContinuousModification::ChangeController],
+        None,
+    );
+    engine::game::layers::evaluate_layers(runner.state_mut());
+    assert_eq!(runner.state().objects[&attacker].controller, P0);
+    let mut combat = engine::game::combat::CombatState::default();
+    let mut attacking = engine::game::combat::AttackerInfo::attacking_player(attacker, P1);
+    attacking.blocked = true;
+    combat.attackers.push(attacking);
+    combat.blocker_assignments.insert(attacker, vec![blocker]);
+    combat.blocker_to_attacker.insert(blocker, vec![attacker]);
+    runner.state_mut().combat = Some(combat);
+    runner.state_mut().phase = Phase::CombatDamage;
+    let mut rules = engine::types::custom_format::old_school_93_94().rules;
+    rules.legality.legacy.damage_timing = engine::types::custom_format::CombatDamageTiming::OnStack;
+    runner.state_mut().format_config =
+        engine::types::format::FormatConfig::for_custom_rules(&rules);
+    let source = ObjectIncarnationRef::from_object(&runner.state().objects[&attacker]);
+    engine::game::combat_damage::resolve_combat_damage(runner.state_mut(), &mut Vec::new());
+    assert_eq!(runner.state().stack.len(), 1);
+    runner.act(GameAction::Concede { player_id: P0 }).unwrap();
+    assert_eq!(runner.state().objects[&attacker].controller, PlayerId(2));
+    assert_eq!(
+        runner.state().objects[&attacker].incarnation,
+        source.incarnation
+    );
+    for _ in 0..3 {
+        if runner.state().stack.is_empty() {
+            break;
+        }
+        runner.act(GameAction::PassPriority).unwrap();
+    }
+    assert!(runner.state().stack.is_empty());
+    assert_eq!(runner.state().objects[&blocker].damage_marked, 3);
+    assert_eq!(runner.state().objects[&attacker].damage_marked, 2);
+    assert_eq!(runner.life(PlayerId(2)), 23);
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { player: P1 }
+    ));
+}
+
+#[test]
+fn queued_damage_uses_first_incarnation_after_two_departures() {
+    use engine::types::keywords::Keyword;
+    use engine::types::zones::Zone;
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let attacker = scenario
+        .add_creature(P0, "Original lifelinker", 3, 4)
+        .with_keyword(Keyword::Lifelink)
+        .with_keyword(Keyword::Deathtouch)
+        .id();
+    let blocker = scenario.add_vanilla(P1, 1, 8);
+    let mut runner = scenario.build();
+    advance_to_queued_damage(&mut runner, attacker, blocker);
+    let original = runner.state().objects[&attacker].incarnation;
+    let mut events = Vec::new();
+    for zone in [Zone::Hand, Zone::Battlefield] {
+        engine::game::zones::move_to_zone(runner.state_mut(), attacker, zone, &mut events);
+    }
+    let returned = runner.state_mut().objects.get_mut(&attacker).unwrap();
+    returned.keywords.clear();
+    returned.base_keywords.clear();
+    returned.controller = P1;
+    engine::game::zones::move_to_zone(runner.state_mut(), attacker, Zone::Graveyard, &mut events);
+    runner.pass_both_players();
+    assert_eq!(runner.life(P0), 23);
+    assert_eq!(runner.life(P1), 20);
+    assert_eq!(runner.state().objects[&blocker].zone, Zone::Graveyard);
+    let record = runner
+        .state()
+        .damage_dealt_this_turn
+        .iter()
+        .find(|record| record.source_id == attacker)
+        .unwrap();
+    assert_eq!(record.source_incarnation, Some(original));
+}
+
+#[test]
+fn stacked_strike_eligibility_uses_initial_participants_and_current_double_strike() {
+    use engine::types::actions::GameAction;
+    use engine::types::keywords::Keyword;
+    for (initial, current, expected) in [
+        (Some(Keyword::FirstStrike), None, 2),
+        (Some(Keyword::DoubleStrike), None, 2),
+        (Some(Keyword::FirstStrike), Some(Keyword::DoubleStrike), 4),
+        (None, Some(Keyword::FirstStrike), 2),
+    ] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let attacker = scenario.add_vanilla(P0, 2, 8);
+        let blocker = scenario
+            .add_creature(P1, "First striker", 1, 8)
+            .with_keyword(Keyword::FirstStrike)
+            .id();
+        let mut runner = scenario.build();
+        if let Some(keyword) = initial {
+            let object = runner.state_mut().objects.get_mut(&attacker).unwrap();
+            object.keywords.push(keyword.clone());
+            object.base_keywords.push(keyword);
+        }
+        advance_to_queued_damage(&mut runner, attacker, blocker);
+        for _ in 0..2 {
+            runner.act(GameAction::PassPriority).unwrap();
+        }
+        let object = runner.state_mut().objects.get_mut(&attacker).unwrap();
+        object.keywords.clear();
+        object.base_keywords.clear();
+        if let Some(keyword) = current {
+            object.keywords.push(keyword.clone());
+            object.base_keywords.push(keyword);
+        }
+        for _ in 0..2 {
+            runner.act(GameAction::PassPriority).unwrap();
+        }
+        assert!(matches!(
+            runner.state().stack.back().unwrap().kind,
+            StackEntryKind::CombatDamage {
+                sub_step: CombatDamageSubStep::Regular,
+                ..
+            }
+        ));
+        for _ in 0..2 {
+            runner.act(GameAction::PassPriority).unwrap();
+        }
+        assert_eq!(runner.state().objects[&blocker].damage_marked, expected);
+        assert_eq!(runner.state().objects[&attacker].damage_marked, 1);
+    }
+}
 
 /// Verbatim Oracle text (Scryfall, 2026-09-16).
 const COUNTERSPELL: &str = "Counter target spell.";

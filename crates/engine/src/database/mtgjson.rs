@@ -76,6 +76,11 @@ pub struct AtomicCard {
     pub leadership_skills: Option<LeadershipSkills>,
     #[serde(default)]
     pub printings: Vec<String>,
+    /// Rarity of the printing this AtomicCards entry was built from. MTGJSON's
+    /// AtomicCards mostly omits it, so it stays optional; per-set feeds and
+    /// rarity-enriched exports carry it and feed `CardFace::rarities`.
+    #[serde(default)]
+    pub rarity: String,
     #[serde(default)]
     pub rulings: Vec<Ruling>,
     #[serde(default)]

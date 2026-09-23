@@ -869,6 +869,18 @@ pub(crate) fn identity_projection_for_viewer(
         }
     }
 
+    // CR 702.106b/f: neither the identity nor the number of secret names is
+    // public before reveal. Conspiracies do not use the morph back-face path.
+    for id in &state.command_zone {
+        if state.objects.get(id).is_some_and(|obj| {
+            obj.face_down
+                && crate::game::conspiracy::is_conspiracy(obj)
+                && !can_view_private_for_player(obj.owner)
+        }) {
+            hide(&mut projections, *id);
+        }
+    }
+
     // CR 406.3: A card exiled face down can't be examined by any player
     // except when an instruction allows it. Two modeled look-permission classes:
     // Foretell (the owner may look, CR 702.143e) and Hideaway (CR 702.75a — the
@@ -2227,6 +2239,7 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
             pool.current_sideboard = Arc::new(Vec::new());
             pool.registered_companion = Arc::new(Vec::new());
             pool.current_companion = Arc::new(Vec::new());
+            pool.registered_conspiracy = Arc::new(Vec::new());
             pool.registered_planar_deck = Arc::new(Vec::new());
             pool.registered_scheme_deck = Arc::new(Vec::new());
             pool.current_scheme_deck = Arc::new(Vec::new());
@@ -2663,6 +2676,8 @@ fn hide_card(state: &mut GameState, obj_id: ObjectId) {
         obj.static_definitions.clear();
         obj.printed_ref = None;
         obj.foretold = false;
+        // CR 702.106b/f: secret names (including their count) stay private.
+        obj.chosen_attributes.clear();
     }
 }
 
@@ -2688,6 +2703,7 @@ fn reveal_face_down_identity_to_controller(obj: &mut crate::game::game_object::G
 fn redact_face_down_identity_from_observer(obj: &mut crate::game::game_object::GameObject) {
     obj.name = HIDDEN_CARD_NAME.to_string();
     redact_printed_identity(obj);
+    obj.chosen_attributes.clear();
     obj.printed_ref = None;
     // CR 708.5 + CR 708.2: a face-down permanent has no name and no abilities,
     // and no player but its controller may look at the card underneath.

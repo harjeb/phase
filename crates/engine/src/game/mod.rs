@@ -37,6 +37,7 @@ pub mod cost_payability;
 pub(crate) mod costs;
 pub mod coverage;
 pub mod crew_payment;
+pub mod damage_source;
 pub mod dash;
 #[cfg(test)]
 #[path = "dash_tests.rs"]

@@ -1677,6 +1677,16 @@ pub fn player_protection_from_object(
     player_id: PlayerId,
     source: Option<&crate::game::game_object::GameObject>,
 ) -> bool {
+    player_protection_from_source(state, player_id, source.map(Into::into))
+}
+
+/// CR 702.16e: Damage prevention reads the qualities of the actual source,
+/// not a later incarnation that happens to occupy its storage id.
+pub fn player_protection_from_source(
+    state: &GameState,
+    player_id: PlayerId,
+    source: Option<super::damage_source::DamageSourceView<'_>>,
+) -> bool {
     use crate::game::keywords::source_matches_card_type;
     use crate::types::ability::ControllerRef;
     use crate::types::keywords::ProtectionTarget;
@@ -1733,8 +1743,8 @@ pub fn player_protection_from_object(
                 // player is an opponent's object in 1v1 and free-for-all. Mirrors the
                 // object-level arm in `game/keywords.rs::source_matches_protection_target`.
                 ProtectionTarget::FromPlayer(scope) => match scope {
-                    ControllerRef::Opponent => source_obj.controller != player_id,
-                    ControllerRef::You => source_obj.controller == player_id,
+                    ControllerRef::Opponent => source_obj.controller() != player_id,
+                    ControllerRef::You => source_obj.controller() == player_id,
                     // Target/chosen player refs have no static context here —
                     // fail closed (the parser never emits them for protection).
                     _ => false,

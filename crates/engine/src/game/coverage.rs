@@ -14952,6 +14952,7 @@ have been revealed, Aggressive Detective deals 2 damage to each opponent.";
     /// keyword array, so the tests exercise the production MTGJSON→face path.
     fn tiered_atomic_card(name: &str, oracle: &str, keywords: &[&str]) -> AtomicCard {
         AtomicCard {
+            rarity: String::new(),
             name: name.to_string(),
             mana_cost: Some("{1}{R}".to_string()),
             colors: vec!["R".to_string()],

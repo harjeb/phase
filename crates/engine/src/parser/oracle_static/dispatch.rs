@@ -1913,6 +1913,14 @@ pub(crate) fn parse_static_line_inner(
         return Some(def);
     }
 
+    // CR 205.3i + CR 305.7: "[Subject] {is|are} every nonbasic land type" —
+    // land-type sibling of the every-creature-type grant (Planar Nexus).
+    // Self-reference (`~`) lowers to a CDA; land-filter subjects stay
+    // battlefield-scoped. Reuses the existing `AddSubtype` building block.
+    if let Some(def) = parse_all_nonbasic_land_types_grant(&tp, &text) {
+        return Some(def);
+    }
+
     // CR 702.16k: Player-subject protection ("You have protection from <X>")
     // must be claimed before the permanent-subject continuous path, which would
     // otherwise grant the protection keyword to permanents you control instead

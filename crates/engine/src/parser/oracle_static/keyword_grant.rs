@@ -1123,26 +1123,47 @@ fn grant_exiled_source(input: &str) -> OracleResult<'_, crate::types::ability::T
             ),
         ),
         value(TargetFilter::ExiledBySource, tag("the exiled card")),
-        // "all [creature] cards exiled with it/~". The optional "creature"
-        // qualifier intersects `ExiledBySource` with the Creature type filter
-        // (CR 205.3 — a creature card is type Creature in exile) so Agatha grants
-        // only creature cards' abilities; the untyped form (Myr Welder, Territory
-        // Forge) stays a bare `ExiledBySource`.
+        // "all [<card type>] cards exiled with it/~". The optional qualifier
+        // intersects `ExiledBySource` with that card type (CR 205.3 — a land
+        // card is type Land in exile) so Agatha grants only creature cards'
+        // abilities, Steward of the Harvest only land cards'; the untyped form
+        // (Myr Welder, Territory Forge) stays a bare `ExiledBySource`. The
+        // qualifier is the whole core-card-type axis, not just `creature`, so
+        // every "all <type> cards exiled with" printing shares this arm.
         (
             tag("all "),
-            opt(tag("creature ")),
+            opt(exiled_cards_type_qualifier),
             tag("cards exiled with "),
             alt((tag("it"), tag("~"))),
         )
-            .map(|(_, creature_qualifier, _, _)| match creature_qualifier {
-                Some(_) => TargetFilter::And {
+            .map(|(_, type_qualifier, _, _)| match type_qualifier {
+                Some(type_filter) => TargetFilter::And {
                     filters: vec![
-                        TargetFilter::Typed(TypedFilter::creature()),
+                        TargetFilter::Typed(TypedFilter::new(type_filter)),
                         TargetFilter::ExiledBySource,
                     ],
                 },
                 None => TargetFilter::ExiledBySource,
             }),
+    ))
+    .parse(input)
+}
+
+/// CR 205.3: The optional core-card-type qualifier in "all <type> cards exiled
+/// with it/~" — one `alt` arm per core type, so a new qualifier is one more
+/// leaf rather than a new parser. Returns the type to intersect with
+/// `ExiledBySource`.
+fn exiled_cards_type_qualifier(input: &str) -> OracleResult<'_, crate::types::ability::TypeFilter> {
+    use crate::types::ability::TypeFilter;
+    alt((
+        value(TypeFilter::Creature, tag("creature ")),
+        value(TypeFilter::Land, tag("land ")),
+        value(TypeFilter::Artifact, tag("artifact ")),
+        value(TypeFilter::Enchantment, tag("enchantment ")),
+        value(TypeFilter::Instant, tag("instant ")),
+        value(TypeFilter::Sorcery, tag("sorcery ")),
+        value(TypeFilter::Planeswalker, tag("planeswalker ")),
+        value(TypeFilter::Battle, tag("battle ")),
     ))
     .parse(input)
 }

@@ -586,8 +586,13 @@ pub fn has_indestructible(obj: &GameObject) -> bool {
     obj.keywords.contains(&Keyword::Indestructible)
 }
 
-/// CR 702.16b: Returns true if target's protection prevents interaction from source.
-pub fn protection_prevents_from(target: &GameObject, source: &GameObject) -> bool {
+/// CR 702.16b + CR 702.16e: Protection restricts targeting and prevents damage
+/// from a source with the stated quality, including its last known qualities.
+pub fn protection_prevents_from<'a>(
+    target: &GameObject,
+    source: impl Into<super::damage_source::DamageSourceView<'a>>,
+) -> bool {
+    let source = source.into();
     for kw in &target.keywords {
         if let Keyword::Protection(ref pt) = kw {
             if source_matches_protection_target(pt, target, source) {
@@ -598,11 +603,12 @@ pub fn protection_prevents_from(target: &GameObject, source: &GameObject) -> boo
     false
 }
 
-pub fn source_matches_protection_target(
+pub fn source_matches_protection_target<'a>(
     protection: &ProtectionTarget,
     protected: &GameObject,
-    source: &GameObject,
+    source: impl Into<super::damage_source::DamageSourceView<'a>>,
 ) -> bool {
+    let source = source.into();
     // CR 709.4b: A split source off the stack has the combined colors of both
     // halves; on the stack (the usual protection-source case) it is the chosen
     // half. `effective_colors` no-ops for single-face and on-stack sources.
@@ -648,18 +654,24 @@ pub fn source_matches_protection_target(
         // (target/chosen/etc.) fail closed.
         ProtectionTarget::FromPlayer(scope) => match scope {
             crate::types::ability::ControllerRef::Opponent => {
-                source.controller != protected.controller
+                source.controller() != protected.controller
             }
-            crate::types::ability::ControllerRef::You => source.controller == protected.controller,
+            crate::types::ability::ControllerRef::You => {
+                source.controller() == protected.controller
+            }
             _ => false,
         },
     }
 }
 
-pub fn source_matches_card_type(source: &GameObject, type_name: &str) -> bool {
+pub fn source_matches_card_type<'a>(
+    source: impl Into<super::damage_source::DamageSourceView<'a>>,
+    type_name: &str,
+) -> bool {
     use crate::types::card_type::CoreType;
 
-    let core = &source.card_types.core_types;
+    let source = source.into();
+    let core = source.core_types();
     for (core_type, singular, plural) in [
         (CoreType::Artifact, "artifact", "artifacts"),
         (CoreType::Creature, "creature", "creatures"),
@@ -679,8 +691,7 @@ pub fn source_matches_card_type(source: &GameObject, type_name: &str) -> bool {
     // parser but must match via the creature-subtype list.
     let quality = type_name.to_ascii_lowercase();
     source
-        .card_types
-        .subtypes
+        .subtypes()
         .iter()
         .any(|st| source_subtype_matches_protection_quality(&st.to_ascii_lowercase(), &quality))
 }
@@ -691,7 +702,11 @@ fn source_subtype_matches_protection_quality(source_subtype: &str, quality: &str
     })
 }
 
-pub fn source_matches_quality(source: &GameObject, quality: &str) -> bool {
+pub fn source_matches_quality<'a>(
+    source: impl Into<super::damage_source::DamageSourceView<'a>>,
+    quality: &str,
+) -> bool {
+    let source = source.into();
     // CR 709.4b: combined colors off the stack for a split source; no-op for
     // single-face and on-stack sources.
     let color_count = source.effective_colors().len();
@@ -712,7 +727,7 @@ pub fn source_matches_quality(source: &GameObject, quality: &str) -> bool {
 /// that can be resolved from the source alone without game state access.
 ///
 fn source_matches_protection_filter(
-    source: &GameObject,
+    source: super::damage_source::DamageSourceView<'_>,
     filter: &crate::types::ability::TargetFilter,
 ) -> bool {
     use crate::types::ability::{FilterProp, QuantityExpr, TargetFilter};

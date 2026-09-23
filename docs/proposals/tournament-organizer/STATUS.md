@@ -1,5 +1,7 @@
 # Tournament Organizer — Reality-check on the Phase-61 proposal
 
+For current native persistence changes and the still-unimplemented automatic hosting requirements, see [NATIVE-HOSTING-AUDIT.md](NATIVE-HOSTING-AUDIT.md). The revision-pinned history below remains unchanged.
+
 **As of `upstream/main` @ `9b175e42f` (2026-09-07).**
 
 This document corrects and supersedes the planning framing in the sibling

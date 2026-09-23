@@ -377,6 +377,7 @@ fn eternalize_activation_creates_4_4_black_zombie_copy_with_no_mana_cost() {
 /// path (MTGJSON keyword parse -> `synthesize_all` -> `synthesize_embalm_eternalize`).
 fn atomic_creature(name: &str, mana_cost: &str, keyword: &str, oracle: &str) -> AtomicCard {
     AtomicCard {
+        rarity: String::new(),
         name: name.to_string(),
         mana_cost: Some(mana_cost.to_string()),
         colors: vec!["W".to_string()],
@@ -422,6 +423,7 @@ fn atomic_with_types(
 ) -> AtomicCard {
     let is_creature = types.contains(&"Creature");
     AtomicCard {
+        rarity: String::new(),
         name: name.to_string(),
         mana_cost: Some("{2}{R}".to_string()),
         colors: vec!["R".to_string()],

@@ -484,6 +484,7 @@ use crate::database::mtgjson::{AtomicCard, AtomicIdentifiers};
 
 fn atomic(name: &str, types: &[&str], type_line: &str, oracle: &str) -> AtomicCard {
     AtomicCard {
+        rarity: String::new(),
         name: name.to_string(),
         mana_cost: Some("{2}{W}{B}".to_string()),
         colors: vec!["W".to_string(), "B".to_string()],

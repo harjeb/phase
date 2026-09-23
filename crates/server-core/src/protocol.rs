@@ -271,6 +271,16 @@ pub struct TerminalBootstrapRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum ClientMessage {
+    /// Explicit opt-in, read-only projection for the socket's authenticated seat.
+    /// Native create/join/reconnect and state notifications remain unchanged.
+    #[cfg(feature = "manabrew")]
+    ManabrewSnapshot,
+    #[cfg(feature = "manabrew")]
+    ManabrewResponse {
+        message: crate::manabrew::ClientToServerMessage,
+        #[serde(default)]
+        request_id: Option<u32>,
+    },
     /// First frame the client must send after receiving `ServerHello`. Carries
     /// the client's version identity so the server can enforce compatibility
     /// before accepting any game-affecting message.
@@ -642,11 +652,23 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum ServerMessage {
+    #[cfg(feature = "manabrew")]
+    ManabrewResponseAccepted {
+        request_id: u32,
+        state_revision: u64,
+    },
+    #[cfg(feature = "manabrew")]
+    ManabrewSnapshot {
+        snapshot: Box<crate::manabrew::ManabrewSnapshot>,
+    },
     /// Sent unprompted immediately on WebSocket accept. The client compares
     /// `protocol_version` against its own and refuses to proceed on mismatch.
     /// `build_commit` is the git short-hash of the server binary; it is used
     /// by the lobby to gate joins when host and guest are on different builds.
     ServerHello {
+        /// Version of the optional ManaBrew projection on a Full server.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        manabrew_version: Option<u32>,
         server_version: String,
         build_commit: String,
         protocol_version: u32,
@@ -2299,6 +2321,7 @@ mod tests {
     #[test]
     fn server_hello_roundtrips() {
         let msg = ServerMessage::ServerHello {
+            manabrew_version: Some(1),
             server_version: "0.1.11".to_string(),
             build_commit: "abc1234".to_string(),
             protocol_version: PROTOCOL_VERSION,
@@ -2318,7 +2341,9 @@ mod tests {
                 lobby_protocol_version,
                 public_url,
                 wire_formats,
+                manabrew_version,
             } => {
+                assert_eq!(manabrew_version, Some(1));
                 assert_eq!(server_version, "0.1.11");
                 assert_eq!(build_commit, "abc1234");
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
@@ -2341,6 +2366,7 @@ mod tests {
             build_commit: "abc1234".to_string(),
             protocol_version: PROTOCOL_VERSION,
             mode: ServerMode::LobbyOnly,
+            manabrew_version: None,
             lobby_protocol_version: None,
             public_url: None,
             wire_formats: Vec::new(),

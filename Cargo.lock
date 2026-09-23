@@ -2848,6 +2848,7 @@ version = "0.90.0"
 dependencies = [
  "draft-core",
  "lobby-broker",
+ "manabrew-compat",
  "phase-ai",
  "phase-engine",
  "proptest",

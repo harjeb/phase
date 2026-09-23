@@ -23,7 +23,7 @@ use engine::types::ability::TargetRef;
 use engine::types::card::CardFace;
 use engine::types::casting_costs::{CostReductionEntry, CostReductionOutcome};
 use engine::types::game_state::{
-    GameState, ManaChoice, ManaChoicePrompt, MulliganDecisionPhase, PendingMulliganAction,
+    AutoPassRequest, GameState, ManaChoice, ManaChoicePrompt, MulliganDecisionPhase, PendingMulliganAction,
     ShardChoice, StackEntryKind, WaitingFor,
 };
 use engine::types::interaction::{
@@ -121,8 +121,29 @@ pub struct MulliganPutBackInput {
 /// Every non-Serum-Powder family stays as an upstream value. This wrapper is
 /// necessary because upstream's closed `PromptInput` cannot carry the one
 /// deliberate local [`MulliganPutBackInput`] superset.
+/// Registered card counts are private to the deciding seat; they are not object IDs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SideboardInput {
+    pub presentation: PromptPresentation,
+    pub main: Vec<engine::types::match_config::DeckCardCount>,
+    pub sideboard: Vec<engine::types::match_config::DeckCardCount>,
+    pub min_main_deck_size: u32,
+    pub max_sideboard_size: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+pub enum SideboardOutput {
+    SubmitSideboard {
+        main: Vec<engine::types::match_config::DeckCardCount>,
+        sideboard: Vec<engine::types::match_config::DeckCardCount>,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub enum PromptInput {
+    Sideboard(SideboardInput),
     Upstream(UpstreamPromptInput),
     MulliganPutBack(MulliganPutBackInput),
 }
@@ -223,11 +244,13 @@ impl PromptInput {
         output: &PromptOutput,
     ) -> std::result::Result<(), ResponseViolation> {
         match (self, output) {
+            (Self::Sideboard(_), PromptOutput::Sideboard(_)) => Ok(()),
             (
                 Self::MulliganPutBack(_),
                 PromptOutput::Upstream(UpstreamPromptOutput::MulliganPutBack(_)),
             ) => Ok(()),
             (Self::Upstream(UpstreamPromptInput::Mulligan(_)), PromptOutput::Mulligan(_)) => Ok(()),
+            (Self::Upstream(UpstreamPromptInput::ChooseAction(_)), PromptOutput::AutoPass(_)) => Ok(()),
             (Self::Upstream(input), PromptOutput::Upstream(output)) => {
                 input.validate_response(output)
             }
@@ -255,6 +278,7 @@ impl From<UpstreamPromptInput> for PromptInput {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum PromptInputWire<'a> {
+    Sideboard(&'a SideboardInput),
     MulliganPutBack(&'a MulliganPutBackInput),
 }
 
@@ -264,6 +288,7 @@ impl Serialize for PromptInput {
         S: serde::Serializer,
     {
         match self {
+            Self::Sideboard(input) => PromptInputWire::Sideboard(input).serialize(serializer),
             Self::Upstream(input) => input.serialize(serializer),
             Self::MulliganPutBack(input) => {
                 PromptInputWire::MulliganPutBack(input).serialize(serializer)
@@ -278,6 +303,11 @@ impl<'de> Deserialize<'de> for PromptInput {
         D: serde::Deserializer<'de>,
     {
         let value = serde_json::Value::deserialize(deserializer)?;
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("sideboard") {
+            return serde_json::from_value(value)
+                .map(Self::Sideboard)
+                .map_err(<D::Error as serde::de::Error>::custom);
+        }
         if value.get("type").and_then(serde_json::Value::as_str) == Some("mulliganPutBack") {
             serde_json::from_value(value)
                 .map(Self::MulliganPutBack)
@@ -292,13 +322,27 @@ impl<'de> Deserialize<'de> for PromptInput {
 
 /// Extension-aware prompt output.
 ///
-/// Every non-Serum-Powder family stays as an upstream value. This wrapper is
-/// necessary because upstream's closed `PromptOutput` cannot carry the one
-/// deliberate local [`MulliganOutput`] superset.
+/// Upstream families retain their wire shape. Local extensions support Serum
+/// Powder and a native auto-pass preference without inventing AvailableActions.
 #[derive(Debug, Clone)]
 pub enum PromptOutput {
+    Sideboard(SideboardOutput),
+    AutoPass(AutoPassOutput),
     Mulligan(MulliganOutput),
     Upstream(UpstreamPromptOutput),
+}
+
+/// An explicit native priority preference; never an advertised rules action.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+pub enum AutoPassOutput {
+    AutoPass { mode: AutoPassMode },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AutoPassMode {
+    TurnBoundary,
 }
 
 impl PromptOutput {
@@ -402,6 +446,8 @@ impl From<UpstreamPromptOutput> for PromptOutput {
 #[derive(Serialize)]
 #[serde(tag = "type", content = "output", rename_all = "camelCase")]
 enum PromptOutputWire<'a> {
+    Sideboard(&'a SideboardOutput),
+    AutoPass(&'a AutoPassOutput),
     Mulligan(&'a MulliganOutput),
 }
 
@@ -411,6 +457,8 @@ impl Serialize for PromptOutput {
         S: serde::Serializer,
     {
         match self {
+            Self::Sideboard(output) => PromptOutputWire::Sideboard(output).serialize(serializer),
+            Self::AutoPass(output) => PromptOutputWire::AutoPass(output).serialize(serializer),
             Self::Mulligan(output) => PromptOutputWire::Mulligan(output).serialize(serializer),
             Self::Upstream(output) => output.serialize(serializer),
         }
@@ -423,6 +471,30 @@ impl<'de> Deserialize<'de> for PromptOutput {
         D: serde::Deserializer<'de>,
     {
         let value = serde_json::Value::deserialize(deserializer)?;
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("sideboard") {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Wire {
+                #[serde(rename = "type")]
+                _kind: String,
+                output: SideboardOutput,
+            }
+            return serde_json::from_value::<Wire>(value)
+                .map(|wire| Self::Sideboard(wire.output))
+                .map_err(<D::Error as serde::de::Error>::custom);
+        }
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("autoPass") {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Wire {
+                #[serde(rename = "type")]
+                _kind: String,
+                output: AutoPassOutput,
+            }
+            return serde_json::from_value::<Wire>(value)
+                .map(|wire| Self::AutoPass(wire.output))
+                .map_err(<D::Error as serde::de::Error>::custom);
+        }
         if value.get("type").and_then(serde_json::Value::as_str) == Some("mulligan") {
             let output = value
                 .get("output")
@@ -440,8 +512,8 @@ impl<'de> Deserialize<'de> for PromptOutput {
 }
 
 /// Extension-aware transport envelope. Its fields are upstream protocol types
-/// except for the prompt wrapper required to carry the two documented local
-/// mulligan members above.
+/// except for the prompt wrapper required to carry local mulligan and native
+/// auto-pass extensions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentPrompt {
@@ -529,8 +601,40 @@ pub trait CardTextLookup {
 
 impl CardTextLookup for CardDatabase {
     fn text_for(&self, object: &GameObject) -> Option<String> {
-        let printed_ref = object.printed_ref.as_ref()?;
-        text_from_face(self.get_face_by_printed_ref(printed_ref)?)
+        if let Some(printed_ref) = object.printed_ref.as_ref() {
+            if let Some(text) = self
+                .get_face_by_printed_ref(printed_ref)
+                .and_then(text_from_face)
+            {
+                return Some(text);
+            }
+        }
+        // Fall back to the printing-independent face index. A planar/scheme
+        // card created from a deck-list face can carry a printed ref the local
+        // database was not built with (synthesized or partial card pools); the
+        // name still resolves and the client needs the text either way.
+        if let Some(text) = self.get_face_by_name(&object.name).and_then(text_from_face) {
+            return Some(text);
+        }
+        // CR 901.4 / CR 904.4: a plane or scheme card is supplementary
+        // chrome, not a rules-bearing card face the local pool must always
+        // contain, and the board renders it from its name alone. Yield empty
+        // text rather than failing the whole snapshot when the face is absent.
+        if object.is_token
+            || object.card_types.core_types.iter().any(|t| {
+                matches!(
+                    t,
+                    engine::types::CoreType::Plane | engine::types::CoreType::Scheme
+                )
+            })
+        {
+            return Some(String::new());
+        }
+        // CR 114.5: an emblem has no card face — its rules text lives in its
+        // abilities, not a printing, so there is nothing to look up. Its name
+        // and `emblem_source` still identify the chip on the client, so yield
+        // empty text instead of failing the whole snapshot.
+        object.emblem_source.as_ref().map(|_| String::new())
     }
 }
 
@@ -630,7 +734,7 @@ pub fn prepare_snapshot_with_prompt_id(
     game_id: impl Into<String>,
     prompt_id: u32,
 ) -> Result<PreparedManabrewSnapshot> {
-    if raw_state.players.len() != 2 {
+    if !(2..=4).contains(&raw_state.players.len()) {
         return Err(AdapterError::UnsupportedPlayerCount {
             count: raw_state.players.len(),
         });
@@ -683,7 +787,7 @@ pub fn unsupported_protocol_capabilities() -> &'static [UnsupportedCapability] {
 /// `upstream.` = the protocol has no primitive for something the engine can do.
 /// `local.` = the protocol has the primitive but this engine cannot source it,
 /// or a documented adapter-local extension is intentionally in use.
-static UNSUPPORTED_PROTOCOL_CAPABILITIES: [UnsupportedCapability; 93] = [
+static UNSUPPORTED_PROTOCOL_CAPABILITIES: [UnsupportedCapability; 92] = [
     UnsupportedCapability {
         code: "upstream.object-selection-missing",
         area: "prompts",
@@ -773,12 +877,6 @@ static UNSUPPORTED_PROTOCOL_CAPABILITIES: [UnsupportedCapability; 93] = [
         area: "mana",
         reason: "Phase requires explicit mana payment finalization; pay.auto asks the client's peer to choose which sources to tap, which is a planning decision this adapter must not make.",
         suggested_protocol_extension: "Define auto-pay as a separate engine-planner request that returns the chosen PaymentAction sequence.",
-    },
-    UnsupportedCapability {
-        code: "local.exhaust-stack-pass-unsupported",
-        area: "responses",
-        reason: "v2 added ChooseActionOutput::Pass.exhaustStack (pass until the stack empties). Like pass.until it is a multi-window intent, and Phase's PassPriority yields exactly one priority window.",
-        suggested_protocol_extension: "Clarify whether exhaustStack is advisory or requires an engine-backed auto-pass contract, alongside pass.until.",
     },
     UnsupportedCapability {
         code: "local.resolve-all-unsupported",
@@ -1187,7 +1285,7 @@ static UNSUPPORTED_PROTOCOL_CAPABILITIES: [UnsupportedCapability; 93] = [
         code: "local.autopass-settings-unsupported",
         area: "responses",
         reason: "Deliberate and permanent, not a coverage gap. SetAutoPass, CancelAutoPass, SetPhaseStops, SetPriorityPassingMode, SetPriorityYield, SetMayTriggerAutoChoice, and SetTriggerOrderTemplate are client PREFERENCES that happen to travel as GameActions in Phase; none of them changes game state or answers a rules decision. Advertising them as protocol actions would invite a client to treat UI configuration as a play. The related protocol-side intents (pass.until, pass.exhaustStack) have their own entries.",
-        suggested_protocol_extension: "None wanted upstream — see local.pass-until-unsupported and local.exhaust-stack-pass-unsupported for the two intents that DO need a contract decision.",
+        suggested_protocol_extension: "None wanted upstream — exact pass.until targets still need a contract; pass.exhaustStack maps directly to the engine's UntilStackEmpty request.",
     },
     UnsupportedCapability {
         code: "local.distribution-unsupported",
@@ -1374,6 +1472,28 @@ fn build_prompt_input(
 ) -> Result<PromptInput> {
     let waiting_for = &prepared.state.waiting_for;
     match waiting_for {
+        WaitingFor::BetweenGamesSideboard { player, game_number, score, min_main_deck_size, max_sideboard_size } => {
+            if *player != prepared.viewer {
+                return Err(AdapterError::NoAuthorizedPrompt { viewer: prepared.viewer });
+            }
+            let pool = prepared.state.deck_pools.iter().find(|pool| pool.player == *player)
+                .ok_or(AdapterError::NoAuthorizedPrompt { viewer: prepared.viewer })?;
+            let counts = |entries: &[engine::game::deck_loading::DeckEntry]| entries.iter().map(|entry|
+                engine::types::match_config::DeckCardCount { name: entry.card.name.clone(), count: entry.count }
+            ).collect();
+            Ok(PromptInput::Sideboard(SideboardInput {
+                presentation: presentation(format!("Sideboard for game {game_number} · Match {}–{} ({} draws)", score.p0_wins, score.p1_wins, score.draws)),
+                main: counts(&pool.current_main),
+                sideboard: counts(&pool.current_sideboard),
+                min_main_deck_size: *min_main_deck_size,
+                max_sideboard_size: *max_sideboard_size,
+            }))
+        }
+        WaitingFor::BetweenGamesChoosePlayDraw { game_number, score, .. } => Ok(PromptInput::ChooseBoolean(ChooseBooleanInput {
+            presentation: presentation(format!("Game {game_number}: play or draw? · Match {}–{} ({} draws)", score.p0_wins, score.p1_wins, score.draws)),
+            confirm_label: "Play".into(),
+            deny_label: "Draw".into(),
+        })),
         WaitingFor::Priority { .. } => Ok(PromptInput::ChooseAction(ChooseActionInput {
             actions: available_actions(&prepared.state, &prepared.actions),
         })),
@@ -2365,6 +2485,25 @@ pub fn translate_response(
     }
 
     let output = match output {
+        PromptOutput::Sideboard(SideboardOutput::SubmitSideboard { main, sideboard }) => {
+            // The engine owns pool equality and format bounds. Apply only after
+            // translation through the authenticated session action path.
+            return Ok(GameAction::SubmitSideboard { main, sideboard });
+        }
+        PromptOutput::AutoPass(AutoPassOutput::AutoPass { mode: AutoPassMode::TurnBoundary }) => {
+            let WaitingFor::Priority { player } = state.waiting_for else {
+                unreachable!("priority family checked above")
+            };
+            return Ok(GameAction::SetAutoPass {
+                mode: AutoPassRequest::UntilTurnBoundary {
+                    until: if state.active_player == player {
+                        engine::types::game_state::TurnBoundary::EndOfCurrentTurn
+                    } else {
+                        engine::types::game_state::TurnBoundary::MyNextTurnStart
+                    },
+                },
+            });
+        }
         PromptOutput::Mulligan(MulliganOutput::MulliganUseSerumPowder { card_id }) => {
             return Ok(GameAction::MulliganDecision {
                 choice: engine::types::actions::MulliganChoice::UseSerumPowder {
@@ -2538,6 +2677,7 @@ pub fn translate_response(
         // merely unhandled.
         UpstreamPromptOutput::ChooseBoolean(ChooseBooleanOutput::Decision { value }) => {
             match &state.waiting_for {
+                WaitingFor::BetweenGamesChoosePlayDraw { .. } => Ok(GameAction::ChoosePlayDraw { play_first: value }),
                 // CR 603.12: accept or decline the optional trigger.
                 WaitingFor::OptionalEffectChoice { .. } | WaitingFor::OpponentMayChoice { .. } => {
                     Ok(GameAction::DecideOptionalEffect { accept: value })
@@ -2818,6 +2958,17 @@ pub fn convert_available_action(
         // prompt for `WaitingFor::OrderCostReductions`, where each option is one
         // of the engine's distinct locked totals — not by echoing an action id.
         GameAction::OrderCostReductions { .. } => AvailableActionConversion::Skip,
+        GameAction::TurnFaceUp { object_id, .. }
+            if state.objects.get(object_id).is_some_and(engine::game::conspiracy::is_conspiracy) => {
+            AvailableActionConversion::Available(AvailableAction {
+                id,
+                kind: AvailableActionKind::ActivateAbility(ActivatableAbilityInfo {
+                    card_id: encode_object_id(*object_id), ability_index: usize::MAX,
+                    description: "Reveal hidden agenda".into(), is_mana_ability: false,
+                    is_class_level_up: None, cost: None, produced_mana: None,
+                }),
+            })
+        }
         GameAction::Equip { .. }
         | GameAction::CrewVehicle { .. }
         | GameAction::ActivateStation { .. }
@@ -2826,11 +2977,8 @@ pub fn convert_available_action(
         | GameAction::TurnFaceUp { .. } => {
             AvailableActionConversion::Unsupported("local.board-action-unsupported")
         }
-        GameAction::SubmitSideboard { .. } => {
-            AvailableActionConversion::Unsupported("local.deck-dto-not-implemented")
-        }
-        GameAction::ChoosePlayDraw { .. } => {
-            AvailableActionConversion::Unsupported("local.play-draw-unsupported")
+        GameAction::SubmitSideboard { .. } | GameAction::ChoosePlayDraw { .. } => {
+            AvailableActionConversion::Skip
         }
         GameAction::ChooseOption { .. }
         | GameAction::SubmitVoteCandidate { .. }
@@ -2935,7 +3083,26 @@ pub fn convert_available_action(
             AvailableActionConversion::Unsupported("local.dungeon-room-unsupported")
         }
         GameAction::RollPlanarDie => {
-            AvailableActionConversion::Unsupported("local.planar-die-unsupported")
+            // CR 901.9: rolling the planar die is a special action, but the
+            // pinned protocol's `AvailableActionKind` has no special-action
+            // variant. Advertise it as an ability on the active plane so the
+            // client can offer it; the response is resolved by action id, so
+            // the click still reaches `GameAction::RollPlanarDie`.
+            match engine::game::planechase::active_plane(state) {
+                Some(plane_id) => AvailableActionConversion::Available(AvailableAction {
+                    id,
+                    kind: AvailableActionKind::ActivateAbility(ActivatableAbilityInfo {
+                        card_id: encode_object_id(plane_id),
+                        ability_index: usize::MAX,
+                        description: "Roll the planar die".to_string(),
+                        is_mana_ability: false,
+                        is_class_level_up: None,
+                        cost: None,
+                        produced_mana: None,
+                    }),
+                }),
+                None => AvailableActionConversion::Unsupported("local.planar-die-unsupported"),
+            }
         }
         // CR 702.51 (convoke): a payment action, not a priority action — it is
         // advertised through `PaymentActionKind::UseResource` during mana
@@ -4152,6 +4319,8 @@ fn output_family_matches_waiting(
     viewer: PlayerId,
 ) -> bool {
     match output {
+        PromptOutput::Sideboard(_) => matches!(state.waiting_for, WaitingFor::BetweenGamesSideboard { player, .. } if player == viewer),
+        PromptOutput::AutoPass(_) => matches!(state.waiting_for, WaitingFor::Priority { .. }),
         PromptOutput::Mulligan(_) => match &state.waiting_for {
             WaitingFor::MulliganDecision { pending, .. } => {
                 pending_entry_for_viewer(state, viewer, pending)
@@ -4243,7 +4412,8 @@ fn output_family_matches_upstream(
         ),
         UpstreamPromptOutput::ChooseBoolean(_) => matches!(
             waiting_for,
-            WaitingFor::OptionalEffectChoice { .. }
+            WaitingFor::BetweenGamesChoosePlayDraw { .. }
+                | WaitingFor::OptionalEffectChoice { .. }
                 | WaitingFor::OpponentMayChoice { .. }
                 | WaitingFor::MiracleReveal { .. }
                 | WaitingFor::ExertChoice { .. }
@@ -4314,6 +4484,8 @@ fn open_prompt_is_generic_number(state: &GameState, viewer: PlayerId) -> bool {
 /// The output's family tag, for diagnostics.
 fn output_family(output: &PromptOutput) -> &'static str {
     match output {
+        PromptOutput::Sideboard(_) => "sideboard",
+        PromptOutput::AutoPass(_) => "autoPass",
         PromptOutput::Mulligan(_) => "mulligan",
         PromptOutput::Upstream(output) => match output {
             UpstreamPromptOutput::Mulligan(_) => "mulligan",
@@ -4348,8 +4520,8 @@ fn translate_choose_action_output(
             until: None,
             exhaust_stack: false,
         } => Ok(GameAction::PassPriority),
-        // Both modifiers ask the engine to keep passing past this priority
-        // window; neither maps onto a single `GameAction`.
+        // An exact player/phase stop is not a native turn boundary. Never
+        // silently weaken it, including when both modifiers are supplied.
         ChooseActionOutput::Pass { until: Some(_), .. } => {
             Err(AdapterError::UnsupportedProtocolFeature {
                 code: "local.pass-until-unsupported",
@@ -4358,8 +4530,8 @@ fn translate_choose_action_output(
         ChooseActionOutput::Pass {
             exhaust_stack: true,
             ..
-        } => Err(AdapterError::UnsupportedProtocolFeature {
-            code: "local.exhaust-stack-pass-unsupported",
+        } => Ok(GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilStackEmpty,
         }),
         ChooseActionOutput::RestoreSnapshot { .. } => {
             Err(AdapterError::UnsupportedProtocolFeature {
@@ -5313,6 +5485,34 @@ mod tests {
             opponent_hand["count"], 1,
             "but the count stays truthful — count may exceed cards.len()"
         );
+    }
+
+    #[test]
+    fn multiplayer_hands_remain_private_for_every_viewer() {
+        for count in [3, 4] {
+            let mut state =
+                GameState::new(engine::types::format::FormatConfig::commander(), count, 7);
+            for seat in 0..count {
+                create_object(
+                    &mut state,
+                    CardId(1),
+                    PlayerId(seat),
+                    format!("Seat {seat} hand"),
+                    Zone::Hand,
+                );
+            }
+            for viewer in 0..count {
+                let zones = zones_of(&state, PlayerId(viewer));
+                for owner in 0..count {
+                    let hand = find_zone(&zones, "hand", &format!("player-{owner}"));
+                    assert_eq!(hand["count"], 1);
+                    assert_eq!(
+                        hand["cards"].as_array().unwrap().len(),
+                        usize::from(owner == viewer)
+                    );
+                }
+            }
+        }
     }
 
     /// Rule 2: a library is a count alone. (The top card becomes a visible entry
@@ -8034,7 +8234,53 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_response_modifiers_are_rejected() {
+    fn auto_pass_turn_boundary_preserves_authority_and_native_progression() {
+        use engine::types::game_state::TurnBoundary;
+        let wire = serde_json::json!({
+            "type": "autoPass", "output": { "type": "autoPass", "mode": "turnBoundary" }
+        });
+        let output: PromptOutput = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&output).unwrap(), wire);
+        assert_eq!(PromptInput::ChooseAction(ChooseActionInput { actions: vec![] })
+            .validate_response(&output), Ok(()));
+        assert_eq!(PromptInput::GameOver(GameOverInput {}).validate_response(&output),
+            Err(ResponseViolation::WrongPromptType));
+        assert!(serde_json::from_value::<PromptOutput>(serde_json::json!({
+            "type": "autoPass", "output": { "type": "autoPass", "mode": "arbitraryPhase" }
+        })).is_err());
+        let context = context_with(vec![GameAction::PassPriority]);
+        let mut state = GameState::new_two_player(7);
+        state.waiting_for = WaitingFor::Priority { player: PlayerId(0) };
+        for (active, expected) in [
+            (PlayerId(0), TurnBoundary::EndOfCurrentTurn),
+            (PlayerId(1), TurnBoundary::MyNextTurnStart),
+        ] {
+            state.active_player = active;
+            let action = translate_response(7, output.clone(), &context, &state).unwrap();
+            assert!(matches!(action, GameAction::SetAutoPass {
+                mode: AutoPassRequest::UntilTurnBoundary { until }
+            } if until == expected));
+            let mut applied = state.clone();
+            engine::game::engine::apply(&mut applied, PlayerId(0), action).unwrap();
+            assert!(!matches!(applied.waiting_for, WaitingFor::Priority { player } if player == PlayerId(0)),
+                "installing auto-pass must immediately relinquish current priority");
+            assert!(matches!(applied.auto_pass.get(&PlayerId(0)),
+                Some(engine::types::game_state::AutoPassMode::UntilTurnBoundary { until })
+                    if *until == expected),
+                "the request must retain native continuation after the first pass");
+        }
+        assert!(matches!(translate_response(8, output.clone(), &context, &state),
+            Err(AdapterError::PromptIdMismatch { .. })));
+        state.waiting_for = WaitingFor::Priority { player: PlayerId(1) };
+        assert!(matches!(translate_response(7, output.clone(), &context, &state),
+            Err(AdapterError::NoAuthorizedPrompt { .. })));
+        state.waiting_for = WaitingFor::ManaPayment { player: PlayerId(0), convoke_mode: None };
+        assert!(matches!(translate_response(7, output, &context, &state),
+            Err(AdapterError::IllegalResponseForPrompt { response_kind: "autoPass" })));
+    }
+
+    #[test]
+    fn pass_modifiers_preserve_native_scope_and_prompt_authorization() {
         let context = context_with(vec![GameAction::PassPriority]);
         let mut state = GameState::new_two_player(7);
         state.waiting_for = WaitingFor::Priority {
@@ -8059,7 +8305,8 @@ mod tests {
             })
         ));
 
-        // v2's new `exhaustStack` is the same class of multi-window intent.
+        // Stack exhaustion installs the engine's interruptible session; it
+        // must not collapse to a single pass or replay passes in the adapter.
         assert!(matches!(
             translate_response(
                 7,
@@ -8070,9 +8317,40 @@ mod tests {
                 &context,
                 &state,
             ),
-            Err(AdapterError::UnsupportedProtocolFeature {
-                code: "local.exhaust-stack-pass-unsupported"
+            Ok(GameAction::SetAutoPass {
+                mode: AutoPassRequest::UntilStackEmpty
             })
+        ));
+
+        let exhaust = PromptOutput::ChooseAction(ChooseActionOutput::Pass {
+            until: None,
+            exhaust_stack: true,
+        });
+        assert!(matches!(
+            translate_response(8, exhaust.clone(), &context, &state),
+            Err(AdapterError::PromptIdMismatch { .. })
+        ));
+        assert!(matches!(
+            translate_response(
+                7,
+                PromptOutput::ChooseAction(ChooseActionOutput::Pass {
+                    until: Some(PassUntil {
+                        player_id: "player-0".to_string(),
+                        phase: StepKind::Main1,
+                    }),
+                    exhaust_stack: true,
+                }),
+                &context,
+                &state,
+            ),
+            Err(AdapterError::UnsupportedProtocolFeature {
+                code: "local.pass-until-unsupported"
+            })
+        ));
+        state.waiting_for = WaitingFor::Priority { player: PlayerId(1) };
+        assert!(matches!(
+            translate_response(7, exhaust, &context, &state),
+            Err(AdapterError::NoAuthorizedPrompt { .. })
         ));
 
         state.waiting_for = WaitingFor::ManaPayment {
@@ -8712,13 +8990,13 @@ mod tests {
     #[test]
     fn unsupported_capability_registry_is_well_formed() {
         let capabilities = unsupported_protocol_capabilities();
-        assert_eq!(capabilities.len(), 93);
+        assert_eq!(capabilities.len(), 92);
 
         let codes: HashSet<_> = capabilities
             .iter()
             .map(|capability| capability.code)
             .collect();
-        assert_eq!(codes.len(), 93, "capability codes must be unique");
+        assert_eq!(codes.len(), capabilities.len(), "capability codes must be unique");
 
         for capability in capabilities {
             assert!(
@@ -8888,7 +9166,6 @@ mod tests {
             "local.mdfc-face-choice-unsupported",
             "local.harmonize-tap-unsupported",
             "local.payment-resource-actions-missing",
-            "local.exhaust-stack-pass-unsupported",
             "local.resolve-all-unsupported",
             // Every code the adapter can emit must be declared here, or a
             // client that receives it looks it up and finds nothing.
@@ -8912,6 +9189,7 @@ mod tests {
         }
 
         for obsolete in [
+            "local.exhaust-stack-pass-unsupported",
             // v2 defines the PromptId/response envelope this described.
             "upstream.response-envelope-mismatch",
             // v2's PaymentAction supplies the payment primitives.

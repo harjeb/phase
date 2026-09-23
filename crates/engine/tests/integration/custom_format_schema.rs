@@ -14,9 +14,10 @@ use engine::types::custom_format::{
     assert_no_lobby_save_sentinel_collision, bundled_presets, old_school_93_94, old_school_95,
     passes_legacy_axis_gate, passes_reprint_fidelity_gate, swedish_old_school,
     validate_custom_rules_consistency, AntePolicy, CombatDamageTiming, CommandZoneMode,
-    CommanderEligibilityRule, CustomFormatDef, CustomFormatId, CustomFormatRules, LegacyRuleSet,
-    LegalityRules, LegendRuleScope, ManaBurnPolicy, PrintingFidelity, ReprintPolicy, SetCode,
-    StructuralRules, WishOutsideGameScope, LOBBY_SAVE_CUSTOM_FORMAT_ID,
+    CommanderEligibilityRule, CustomFormatDef, CustomFormatId, CustomFormatRules,
+    HistoricalPrintingPolicy, LegacyRuleSet, LegalityRules, LegendRuleScope, ManaBurnPolicy,
+    PrintingFidelity, ReprintPolicy, SetCode, StructuralRules, WishOutsideGameScope,
+    LOBBY_SAVE_CUSTOM_FORMAT_ID,
 };
 use engine::types::format::{
     DeckCopyLimit, DeckSizeRule, FormatConfig, GameFormat, RangeOfInfluenceConfig, SelectedFormat,
@@ -55,6 +56,7 @@ fn sample_rules(id: u16) -> CustomFormatRules {
                 wish_scope: WishOutsideGameScope::default(),
                 legend_rule_scope: engine::types::custom_format::LegendRuleScope::default(),
                 ante: AntePolicy::default(),
+                ..LegacyRuleSet::default()
             },
         },
     }
@@ -523,6 +525,7 @@ fn set_code_approximation_presets_disclose_the_limitation() {
                 "{} declares SetCodeApproximation but its description does not say so: {:?}",
                 preset.label, preset.description
             ),
+            PrintingFidelity::SelectedPrinting => assert!(!discloses),
             // Paired negative: a preset claiming no printing intent must not
             // carry the disclosure either, or the text is boilerplate rather
             // than a real signal.
@@ -555,18 +558,9 @@ fn every_bundled_preset_has_a_distinct_non_sentinel_id() {
 }
 
 #[test]
-fn custom_format_registry_withholds_swedish_old_school_on_open_item_6() {
-    // Swedish is withheld by a DIFFERENT mechanism from its EC siblings, and
-    // the distinction is the whole point of this test. The EC presets are
-    // listed in the registry and rejected by the legacy-axis gate. Swedish
-    // PASSES both gates, so listing it would register it — its blocker is
-    // CONTEXT.md Open item 6 (unconfirmed reprint-policy metadata), a
-    // documentation-accuracy blocker with no gate to express it, leaving
-    // omission from the list as the only mechanism.
-    //
-    // Asserting both halves is what makes that meaningful: an empty-registry
-    // assertion alone would keep passing if the preset silently started
-    // FAILING a gate, which would hide the real reason it is absent.
+fn custom_format_registry_withholds_swedish_until_printing_ingress_acceptance() {
+    // Printing admission is implemented in the engine. Host-owned catalog and
+    // selected-ID transport plumbing remain required before preset exposure.
     let preset = swedish_old_school();
     assert!(passes_legacy_axis_gate(&preset.rules.legality.legacy));
     assert!(passes_reprint_fidelity_gate(&preset));
@@ -587,7 +581,7 @@ fn custom_format_registry_withholds_swedish_old_school_on_open_item_6() {
     let registry = engine::types::custom_format::custom_format_registry();
     assert!(
         !registry.iter().any(|def| def.rules.id == preset.rules.id),
-        "swedish_old_school() must not be selectable while Open item 6 is unresolved; got {:?}",
+        "swedish_old_school() must remain withheld until printing ingress acceptance; got {:?}",
         registry.iter().map(|def| &def.label).collect::<Vec<_>>()
     );
 }
@@ -670,22 +664,24 @@ fn swedish_old_school_declares_its_sourced_card_pool() {
     // actually keeps those three out of a deck, ahead of this list.
     assert!(actual_restricted.contains("Contract from Below"));
 
-    // An old card pool played under modern rules: the source mentions no mana
-    // burn, damage on the stack, pre-M10 Wish templating or modified legend
-    // rule. This is what makes it the one Axis-B preset needing zero
-    // LegacyRuleSet engine wiring.
-    assert_eq!(legality.legacy, LegacyRuleSet::default());
+    // Modern gameplay, with the sourced selected-printing constraint.
+    assert_eq!(
+        legality.legacy,
+        LegacyRuleSet {
+            printing_policy: HistoricalPrintingPolicy::SwedishOriginal,
+            ..LegacyRuleSet::default()
+        }
+    );
 }
 
 #[test]
-fn swedish_old_school_carries_honest_unresolved_reprint_metadata() {
+fn swedish_old_school_declares_selected_original_english_printings() {
     let preset = swedish_old_school();
-    // Open item 6: the primary source states only "Only English versions are
-    // allowed in Oldschool". `None` says "no confirmed authored intent to
-    // declare" rather than inventing OriginalPrintingsOnly from a secondary
-    // source, and NotApplicable is the pairing PLAN.md §1 requires of it.
-    assert_eq!(preset.reprint_policy, None);
-    assert_eq!(preset.printing_fidelity, PrintingFidelity::NotApplicable);
+    assert_eq!(
+        preset.reprint_policy,
+        Some(ReprintPolicy::OriginalPrintingsOnly)
+    );
+    assert_eq!(preset.printing_fidelity, PrintingFidelity::SelectedPrinting);
 
     // A registry-stable id of its own, never the Axis-A lobby-save sentinel.
     assert_ne!(preset.rules.id, LOBBY_SAVE_CUSTOM_FORMAT_ID);

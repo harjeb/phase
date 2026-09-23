@@ -4594,7 +4594,7 @@ pub(crate) fn priority_actions_with_probe(
     //
     // Split second does NOT stop it: CR 702.61b prohibits casting spells and
     // activating abilities, and a special action is neither (CR 116.1).
-    for &object_id in &state.battlefield {
+    for &object_id in state.battlefield.iter().chain(state.command_zone.iter()) {
         let Some(object) = state.objects.get(&object_id) else {
             continue;
         };

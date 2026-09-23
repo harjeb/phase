@@ -11,8 +11,9 @@ use crate::types::ability::{ShieldKind, TargetRef};
 use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
-    CombatDamageAssignmentMode, CombatDamageSubStep, DamageSlot, GameState, PendingCombatLifelink,
-    PendingLifelinkGain, WaitingFor,
+    AssignedCombatDamage, AssignedDamageRecipient, CombatDamageAssignmentMode, CombatDamageSubStep,
+    DamageSlot, GameState, PendingCombatLifelink, PendingLifelinkGain, StackEntry, StackEntryKind,
+    WaitingFor,
 };
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
 use crate::types::keywords::Keyword;
@@ -48,6 +49,7 @@ fn process_combat_damage_triggers(
     damage_events: &[GameEvent],
     all_events: &mut Vec<GameEvent>,
     include_phase_event: bool,
+    action_event_start: usize,
 ) {
     // Step 1: Collect triggers from damage events while creatures are still alive.
     // CR 603.2: Triggers fire at the moment the event occurs — process_triggers
@@ -89,12 +91,186 @@ fn process_combat_damage_triggers(
     // player before constructing the APNAP ordering pass.
     pending.retain(|ctx| crate::game::players::is_alive(state, ctx.pending.controller));
 
+    // Combat owns ordinary collection for these events. Bind receipts to the
+    // public action buffer, not the synthetic phase/retained batch's ordinals.
+    // A resumed batch may contain events from an earlier action; those already
+    // have receipts and must not manufacture identities in this action.
+    let mut owned = before_priority_events.clone();
+    let occurrences = all_events
+        .iter()
+        .enumerate()
+        .skip(action_event_start)
+        .filter_map(|(index, event)| {
+            let owned_index = owned.iter().position(|candidate| candidate == event)?;
+            owned.remove(owned_index);
+            Some(triggers::ConsumedTriggerEventOccurrence {
+                event: event.clone(),
+                occurrence: triggers::trigger_event_occurrence(all_events, index),
+                scope: triggers::ConsumedTriggerEventScope::OrdinaryCollectorsOnly,
+            })
+        })
+        .collect();
+    triggers::resolve_and_apply_trigger_collection(
+        state,
+        crate::types::resolved_commands::ResolvedTriggerCollection::ConsumeBeforePriority {
+            occurrences,
+        },
+    )
+    .expect("combat trigger collection must have a live journal cause");
+
     triggers::process_collected_triggers_with_delayed_events(
         state,
         pending,
         &before_priority_events,
         all_events,
     );
+}
+
+fn damage_uses_stack(state: &GameState) -> bool {
+    let timing = state
+        .format_config
+        .custom_rules
+        .as_deref()
+        .map(|rules| rules.legality.legacy.damage_timing)
+        .unwrap_or_default();
+    match timing {
+        crate::types::custom_format::CombatDamageTiming::Modern => false,
+        crate::types::custom_format::CombatDamageTiming::OnStack => true,
+    }
+}
+
+fn combat_priority_player(state: &GameState) -> PlayerId {
+    if super::players::is_alive(state, state.active_player) {
+        super::turn_control::turn_decision_maker(state)
+    } else {
+        super::players::next_player_in_turn_order(state, state.active_player)
+    }
+}
+
+fn includes_step_start(state: &GameState, sub_step: CombatDamageSubStep) -> bool {
+    match sub_step {
+        CombatDamageSubStep::FirstStrike => true,
+        CombatDamageSubStep::Regular => state.combat.as_ref().is_some_and(|c| {
+            !c.first_strike_done
+                && c.first_strike_participants
+                    .as_ref()
+                    .is_none_or(|participants| participants.is_empty())
+        }),
+    }
+}
+
+/// Pre-M10 combat: freeze all assignments as one nonspell, nonability object,
+/// then give players priority before dealing any of the assigned damage.
+fn queue_combat_damage(
+    state: &mut GameState,
+    pending: &[(ObjectId, DamageAssignment)],
+    sub_step: CombatDamageSubStep,
+    events: &mut Vec<GameEvent>,
+) -> WaitingFor {
+    let assignments = pending
+        .iter()
+        .map(|(source, assignment)| AssignedCombatDamage {
+            source: ObjectIncarnationRef::from_object(&state.objects[source]),
+            target: match assignment.target {
+                DamageTarget::Object(id) => AssignedDamageRecipient::Object(
+                    ObjectIncarnationRef::from_object(&state.objects[&id]),
+                ),
+                DamageTarget::Player(id) => AssignedDamageRecipient::Player(id),
+            },
+            amount: assignment.amount,
+        })
+        .collect();
+    let id = ObjectId(state.next_object_id);
+    state.next_object_id += 1;
+    super::stack::push_to_stack(
+        state,
+        StackEntry {
+            id,
+            source_id: id,
+            controller: state.active_player,
+            kind: StackEntryKind::CombatDamage {
+                sub_step,
+                assignments,
+            },
+        },
+        events,
+    );
+    super::priority::reset_priority(state);
+    // Beginning-of-step triggers go above the damage object, before priority.
+    let phase_event_start = events.len();
+    let include_phase_event = includes_step_start(state, sub_step);
+    process_combat_damage_triggers(state, &[], events, include_phase_event, phase_event_start);
+    pending_combat_damage_waiting(state).unwrap_or(WaitingFor::Priority {
+        player: combat_priority_player(state),
+    })
+}
+
+/// Resolve a frozen pre-M10 batch using the same simultaneous replacement,
+/// damage, lifelink, trigger, and SBA pipeline as ordinary combat.
+pub(crate) fn resolve_stacked_combat_damage(
+    state: &mut GameState,
+    assignments: &[AssignedCombatDamage],
+    sub_step: CombatDamageSubStep,
+    events: &mut Vec<GameEvent>,
+) {
+    let mut pending = Vec::new();
+    let mut sources = Vec::new();
+    for assignment in assignments {
+        // CR 400.7: an old recipient cannot receive damage after leaving play,
+        // even if a new incarnation has returned under the same storage id.
+        let target = match assignment.target {
+            AssignedDamageRecipient::Object(reference) => {
+                if !reference.is_current(state)
+                    || state.objects[&reference.object_id].zone
+                        != crate::types::zones::Zone::Battlefield
+                    || !state.objects[&reference.object_id]
+                        .card_types
+                        .core_types
+                        .iter()
+                        .any(|kind| {
+                            matches!(
+                                kind,
+                                crate::types::card_type::CoreType::Creature
+                                    | crate::types::card_type::CoreType::Planeswalker
+                                    | crate::types::card_type::CoreType::Battle
+                            )
+                        })
+                {
+                    continue;
+                }
+                DamageTarget::Object(reference.object_id)
+            }
+            AssignedDamageRecipient::Player(player) => {
+                if !super::players::is_alive(state, player) {
+                    continue;
+                }
+                DamageTarget::Player(player)
+            }
+        };
+        pending.push((
+            assignment.source.object_id,
+            DamageAssignment {
+                target,
+                amount: assignment.amount,
+            },
+        ));
+        sources.push(assignment.source);
+    }
+    let batch = apply_combat_damage_with_sources(state, &pending, sub_step, Some(&sources));
+    let start = events.len();
+    events.extend_from_slice(batch.events());
+    let waiting = match batch {
+        CombatDamageBatch::Paused { waiting_for, .. } => {
+            claim_combat_lifelink_batch_events_for_ordinary_collection(state, events, start);
+            Some(*waiting_for)
+        }
+        CombatDamageBatch::Complete(damage_events) => {
+            finish_combat_damage_sub_step(state, sub_step, &damage_events, events, start)
+        }
+    };
+    if let Some(waiting) = waiting {
+        state.waiting_for = waiting;
+    }
 }
 
 /// Resolve combat damage with first strike / double strike support (CR 510.1).
@@ -135,6 +311,16 @@ pub fn resolve_combat_damage(
         return resume_pending_combat_lifelink(state, events.len(), events);
     }
 
+    // A queued batch owns this sub-step until its stack object resolves.
+    if state
+        .stack
+        .iter()
+        .any(|entry| matches!(entry.kind, StackEntryKind::CombatDamage { .. }))
+    {
+        return Some(WaitingFor::Priority {
+            player: combat_priority_player(state),
+        });
+    }
     let combat = state.combat.as_ref()?.clone();
 
     // Guard: regular damage already applied (re-entry from triggers during regular step).
@@ -160,6 +346,14 @@ pub fn resolve_combat_damage(
         }
         // All first-strike assignments collected — apply simultaneously (CR 510.2).
         let pending = take_pending_damage(state);
+        if damage_uses_stack(state) {
+            return Some(queue_combat_damage(
+                state,
+                &pending,
+                CombatDamageSubStep::FirstStrike,
+                events,
+            ));
+        }
         let batch = apply_combat_damage(state, &pending, CombatDamageSubStep::FirstStrike);
         let batch_event_start = events.len();
         events.extend_from_slice(batch.events());
@@ -182,6 +376,7 @@ pub fn resolve_combat_damage(
                     CombatDamageSubStep::FirstStrike,
                     &damage_events,
                     events,
+                    batch_event_start,
                 ) {
                     return Some(wf);
                 }
@@ -195,6 +390,14 @@ pub fn resolve_combat_damage(
     }
     // All regular assignments collected — apply simultaneously (CR 510.2).
     let pending = take_pending_damage(state);
+    if damage_uses_stack(state) {
+        return Some(queue_combat_damage(
+            state,
+            &pending,
+            CombatDamageSubStep::Regular,
+            events,
+        ));
+    }
     let batch = apply_combat_damage(state, &pending, CombatDamageSubStep::Regular);
     let batch_event_start = events.len();
     events.extend_from_slice(batch.events());
@@ -214,6 +417,7 @@ pub fn resolve_combat_damage(
             CombatDamageSubStep::Regular,
             &damage_events,
             events,
+            batch_event_start,
         ),
     }
 }
@@ -228,6 +432,7 @@ fn finish_combat_damage_sub_step(
     sub_step: CombatDamageSubStep,
     damage_events: &[GameEvent],
     events: &mut Vec<GameEvent>,
+    action_event_start: usize,
 ) -> Option<WaitingFor> {
     // CR 500.6: "at the beginning of that step" abilities trigger when the step
     // begins. `process_combat_damage_triggers` synthesizes the PhaseChanged
@@ -240,15 +445,7 @@ fn finish_combat_damage_sub_step(
     //   * no first strike, single sub-step               -> true  (== old true)
     //   * first-strike sub-step ran earlier in THIS call -> first_strike_done -> false
     //   * re-entry after a prior call's first strike     -> first_strike_done -> false
-    let include_phase_event = match sub_step {
-        CombatDamageSubStep::FirstStrike => true,
-        CombatDamageSubStep::Regular => state.combat.as_ref().is_some_and(|c| {
-            !c.first_strike_done
-                && c.first_strike_participants
-                    .as_ref()
-                    .is_none_or(|participants| participants.is_empty())
-        }),
-    };
+    let include_phase_event = !damage_uses_stack(state) && includes_step_start(state, sub_step);
 
     match sub_step {
         CombatDamageSubStep::FirstStrike => {
@@ -264,7 +461,13 @@ fn finish_combat_damage_sub_step(
             }
 
             // CR 510.4: SBAs and triggers run between first-strike and regular damage sub-steps.
-            process_combat_damage_triggers(state, damage_events, events, include_phase_event);
+            process_combat_damage_triggers(
+                state,
+                damage_events,
+                events,
+                include_phase_event,
+                action_event_start,
+            );
 
             // CR 510.4 + CR 603.3b: if the first-strike sub-step produced a same-
             // controller trigger-ordering prompt, surface it now — before the regular
@@ -289,13 +492,13 @@ fn finish_combat_damage_sub_step(
             // Returning here leaves `regular_damage_done == false`; the mandatory regular
             // sub-step is resumed once the stack drains and all players pass, via the
             // empty-stack completeness gate in priority.rs.
-            if !state.stack.is_empty() {
+            if !state.stack.is_empty() || damage_uses_stack(state) {
                 // reset_priority here is defensive — unlike the sibling regular-substep entry in
                 // turns.rs, this returns mid-step after the first-strike substep, so we explicitly
                 // clear any stale passes before the CR 510.3 priority window (harmless if already clear).
                 crate::game::priority::reset_priority(state);
                 return Some(WaitingFor::Priority {
-                    player: state.active_player,
+                    player: combat_priority_player(state),
                 });
             }
             None
@@ -306,7 +509,13 @@ fn finish_combat_damage_sub_step(
                 c.damage_step_index = None;
             }
 
-            process_combat_damage_triggers(state, damage_events, events, include_phase_event);
+            process_combat_damage_triggers(
+                state,
+                damage_events,
+                events,
+                include_phase_event,
+                action_event_start,
+            );
             pending_combat_damage_waiting(state)
         }
     }
@@ -358,8 +567,13 @@ pub(crate) fn resume_pending_combat_lifelink(
         }
         CombatDamageBatch::Complete(damage_events) => {
             events.extend_from_slice(&damage_events[owed_from..]);
-            let waiting_for =
-                finish_combat_damage_sub_step(state, sub_step, &damage_events, events);
+            let waiting_for = finish_combat_damage_sub_step(
+                state,
+                sub_step,
+                &damage_events,
+                events,
+                action_event_start,
+            );
             claim_combat_lifelink_batch_events_for_ordinary_collection(
                 state,
                 events,
@@ -375,7 +589,7 @@ pub(crate) fn resume_pending_combat_lifelink(
             // its own prompt without recursing, and a regular sub-step already
             // done short-circuits on `regular_damage_done`.
             resolve_combat_damage(state, events).or(Some(WaitingFor::Priority {
-                player: state.active_player,
+                player: combat_priority_player(state),
             }))
         }
     }
@@ -766,6 +980,46 @@ fn collect_damage_assignments(
 
         let power = combat_damage_amount(obj);
         if power == 0 {
+            // Historical 310.2a records zero assignments, but an effect that
+            // says to assign no damage still produces no assignment.
+            if !damage_uses_stack(state) || obj.assigns_no_combat_damage {
+                continue;
+            }
+            let assignments = if let Some(blockers) = combat
+                .blocker_assignments
+                .get(&attacker_info.object_id)
+                .filter(|ids| !ids.is_empty())
+            {
+                blockers
+                    .iter()
+                    .map(|&id| DamageAssignment {
+                        target: DamageTarget::Object(id),
+                        amount: 0,
+                    })
+                    .collect()
+            } else {
+                let trample = obj.has_keyword(&Keyword::Trample)
+                    || obj.has_keyword(&Keyword::TrampleOverPlaneswalkers);
+                if attacker_info.blocked && !trample {
+                    Vec::new()
+                } else {
+                    attacker_info
+                        .resolve_damage_target(
+                            state,
+                            obj.has_keyword(&Keyword::TrampleOverPlaneswalkers),
+                        )
+                        .into_iter()
+                        .map(|target| DamageAssignment { target, amount: 0 })
+                        .collect()
+                }
+            };
+            if let Some(c) = &mut state.combat {
+                c.pending_damage.extend(
+                    assignments
+                        .into_iter()
+                        .map(|assignment| (attacker_info.object_id, assignment)),
+                );
+            }
             continue;
         }
 
@@ -936,6 +1190,24 @@ fn collect_damage_assignments(
 
         let power = combat_damage_amount(obj);
         if power == 0 {
+            if damage_uses_stack(state) && !obj.assigns_no_combat_damage {
+                let assignments: Vec<_> = attacker_ids
+                    .iter()
+                    .map(|&id| DamageAssignment {
+                        target: DamageTarget::Object(id),
+                        amount: 0,
+                    })
+                    .collect();
+                if let Some(c) = &mut state.combat {
+                    c.pending_damage.extend(
+                        assignments
+                            .iter()
+                            .cloned()
+                            .map(|assignment| (blocker_id, assignment)),
+                    );
+                    c.damage_assignments.insert(blocker_id, assignments);
+                }
+            }
             continue;
         }
 
@@ -1537,6 +1809,15 @@ pub(crate) fn apply_combat_damage(
     assignments: &[(ObjectId, DamageAssignment)],
     sub_step: CombatDamageSubStep,
 ) -> CombatDamageBatch {
+    apply_combat_damage_with_sources(state, assignments, sub_step, None)
+}
+
+fn apply_combat_damage_with_sources(
+    state: &mut GameState,
+    assignments: &[(ObjectId, DamageAssignment)],
+    sub_step: CombatDamageSubStep,
+    sources: Option<&[ObjectIncarnationRef]>,
+) -> CombatDamageBatch {
     let mut events = Vec::new();
     // CR 510.2 + CR 732.2a: the pre-batch life totals, so the loop-detection ring can be
     // invalidated on the DAMAGE EVENT rather than on a `WaitingFor` window that an
@@ -1559,7 +1840,7 @@ pub(crate) fn apply_combat_damage(
     // and are dropped here; the gate already emitted any required DamagePrevented.
     let mut entries: Vec<BatchEntry> = Vec::with_capacity(assignments.len());
     let mut proposed_events: Vec<ProposedEvent> = Vec::with_capacity(assignments.len());
-    for (source_id, assignment) in assignments {
+    for (index, (source_id, assignment)) in assignments.iter().enumerate() {
         // Read commander flag before DamageContext borrows — both are immutable reads.
         let source_is_commander = state
             .objects
@@ -1568,14 +1849,23 @@ pub(crate) fn apply_combat_damage(
             .unwrap_or(false);
         // In practice, from_source always succeeds during combat (source is on battlefield).
         // CR 702.15c: Fallback uses LKI controller when the source is gone.
-        let mut ctx = DamageContext::from_source(state, *source_id).unwrap_or_else(|| {
-            let controller = state
-                .lki_cache
-                .get(source_id)
-                .map(|lki| lki.controller)
-                .unwrap_or(state.active_player);
-            DamageContext::fallback(*source_id, controller)
-        });
+        let mut ctx = if let Some(sources) = sources {
+            // CR 400.7 + CR 702.15c: read exactly the assigned source, using
+            // its LKI after departure, never a later same-id incarnation.
+            let Some(context) = DamageContext::from_incarnation(state, sources[index]) else {
+                continue;
+            };
+            context
+        } else {
+            DamageContext::from_source(state, *source_id).unwrap_or_else(|| {
+                let controller = state
+                    .lki_cache
+                    .get(source_id)
+                    .map(|lki| lki.controller)
+                    .unwrap_or(state.active_player);
+                DamageContext::fallback(*source_id, controller)
+            })
+        };
 
         // CR 119.3 + CR 702.15b: defer lifelink to a single per-source life-gain
         // after the whole simultaneous batch is applied. A source dealing combat
@@ -1781,6 +2071,9 @@ fn drain_combat_lifelink(
 ) -> CombatDamageBatch {
     let waiting_before = state.waiting_for.clone();
     while let Some(gain) = record.remaining.pop_front() {
+        if !super::players::is_alive(state, gain.controller) {
+            continue;
+        }
         match crate::game::effects::life::apply_life_gain(
             state,
             gain.controller,

@@ -7,6 +7,8 @@ pub mod encore;
 #[cfg(feature = "forge")]
 pub mod forge;
 pub mod haunt;
+pub mod historical_card_text;
+pub mod historical_printing;
 pub mod hideaway;
 pub mod legality;
 pub mod meld;

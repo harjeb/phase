@@ -10213,6 +10213,23 @@ fn keyword_granted_by_level_gated_static(stat: &StaticDefinition) -> Vec<Keyword
     gated
 }
 
+/// Map an MTGJSON `rarity` string to the `CardFace::rarities` set. Empty or
+/// unknown values yield an empty set, which is the pre-existing behavior for
+/// AtomicCards feeds that do not carry rarity.
+fn parse_atomic_rarities(rarity: &str) -> std::collections::BTreeSet<crate::types::card::Rarity> {
+    use crate::types::card::Rarity;
+    let mapped = match rarity.to_ascii_lowercase().as_str() {
+        "common" => Some(Rarity::Common),
+        "uncommon" => Some(Rarity::Uncommon),
+        "rare" => Some(Rarity::Rare),
+        "mythic" => Some(Rarity::Mythic),
+        "special" => Some(Rarity::Special),
+        "bonus" => Some(Rarity::Bonus),
+        _ => None,
+    };
+    mapped.into_iter().collect()
+}
+
 /// Build a `CardFace` from MTGJSON data, running the Oracle text parser and all synthesis.
 /// Both `oracle_loader.rs` and `oracle_gen.rs` call this to ensure identical processing.
 pub fn build_oracle_face(mtgjson: &AtomicCard, oracle_id: Option<String>) -> CardFace {
@@ -10486,7 +10503,7 @@ fn build_oracle_face_inner(
         is_oathbreaker: false,
         deck_copy_limit: None,
         metadata: Default::default(),
-        rarities: Default::default(),
+        rarities: parse_atomic_rarities(&mtgjson.rarity),
         attraction_lights: vec![],
     };
 
@@ -10980,6 +10997,7 @@ mod cycling_synthesis_tests {
                       Cycling {1}{U} ({1}{U}, Discard this card: Draw a card.)\n\
                       When you cycle this card, each opponent mills four cards.";
         let mtgjson = AtomicCard {
+            rarity: String::new(),
             name: "Fractured Sanity".to_string(),
             mana_cost: Some("{3}{U}".to_string()),
             colors: vec!["U".to_string()],
@@ -11062,6 +11080,7 @@ mod cycling_synthesis_tests {
         let oracle = "This spell can't be countered.\n\
                       Target opponent reveals their hand. Exile all noncreature, nonland cards from that player's hand and graveyard.";
         let mtgjson = AtomicCard {
+            rarity: String::new(),
             name: "Thought Distortion".to_string(),
             mana_cost: Some("{4}{B}{B}".to_string()),
             colors: vec!["B".to_string()],
@@ -11208,6 +11227,7 @@ mod cycling_synthesis_tests {
                       Whenever Storm attacks, until end of turn, another target attacking \
                       creature gains flying and gets +X/+0, where X is Storm's power.";
         let storm = AtomicCard {
+            rarity: String::new(),
             name: "Storm, Queen of Wakanda".to_string(),
             mana_cost: Some("{3}{W}".to_string()),
             colors: vec!["W".to_string()],
@@ -11260,6 +11280,7 @@ mod cycling_synthesis_tests {
         use crate::database::mtgjson::AtomicIdentifiers;
 
         let men = AtomicCard {
+            rarity: String::new(),
             name: "Flying Men".to_string(),
             mana_cost: Some("{U}".to_string()),
             colors: vec!["U".to_string()],
@@ -11302,6 +11323,7 @@ mod cycling_synthesis_tests {
     fn counter_phrase_card(name: &str, oracle: &str, mtgjson_keywords: &[&str]) -> AtomicCard {
         use crate::database::mtgjson::AtomicIdentifiers;
         AtomicCard {
+            rarity: String::new(),
             name: name.to_string(),
             mana_cost: Some("{1}{W}".to_string()),
             colors: vec!["W".to_string()],
@@ -12001,6 +12023,7 @@ mod evoke_synthesis_tests {
         use crate::types::keywords::EvokeCost;
 
         let mtgjson = AtomicCard {
+            rarity: String::new(),
             name: "Solitude".to_string(),
             mana_cost: Some("{3}{W}{W}".to_string()),
             colors: vec!["W".to_string()],
@@ -14413,6 +14436,7 @@ mod provoke_synthesis_tests {
     #[test]
     fn build_oracle_face_recovers_repeated_provoke_instances_from_oracle_text() {
         let mtgjson = AtomicCard {
+            rarity: String::new(),
             name: "Repeated Provoke Test".to_string(),
             mana_cost: Some("{2}{G}".to_string()),
             colors: vec!["G".to_string()],
@@ -15505,6 +15529,7 @@ mod increment_synthesis_tests {
 
     fn increment_atomic_card(text: &str) -> AtomicCard {
         AtomicCard {
+            rarity: String::new(),
             name: "Topiary Lecturer".to_string(),
             mana_cost: Some("{2}{G}".to_string()),
             colors: vec!["G".to_string()],
@@ -22056,6 +22081,7 @@ mod bloodthirst_synthesis_tests {
     #[test]
     fn mtgjson_bloodthirst_x_oracle_overrides_fixed_fallback() {
         let mtgjson = AtomicCard {
+            rarity: String::new(),
             name: "Petrified Wood-Kin".to_string(),
             mana_cost: Some("{6}{G}".to_string()),
             colors: vec!["G".to_string()],
@@ -22123,6 +22149,7 @@ mod bloodthirst_synthesis_tests {
         text: &str,
     ) -> AtomicCard {
         AtomicCard {
+            rarity: String::new(),
             name: name.to_string(),
             mana_cost: Some("{8}{R}{G}".to_string()),
             colors: vec!["G".to_string(), "R".to_string()],
@@ -22243,6 +22270,7 @@ mod bloodthirst_synthesis_tests {
     /// to one "Myriad"; the synthesis pipeline must recover the printed count.
     fn myriad_atomic(name: &str, subtypes: Vec<String>, text: &str) -> AtomicCard {
         AtomicCard {
+            rarity: String::new(),
             name: name.to_string(),
             mana_cost: Some("{4}{G}".to_string()),
             colors: vec!["G".to_string()],
@@ -22375,6 +22403,7 @@ mod bloodthirst_synthesis_tests {
     #[test]
     fn build_oracle_face_drops_craft_default_when_material_constraint_is_unparsed() {
         let mtgjson = AtomicCard {
+            rarity: String::new(),
             name: "Threefold Thunderhulk".to_string(),
             mana_cost: Some("{7}".to_string()),
             colors: Vec::new(),
@@ -26187,6 +26216,7 @@ mod tiered_synthesis_tests {
 
     fn tiered_atomic_card(name: &str, oracle: &str, keywords: Option<Vec<String>>) -> AtomicCard {
         AtomicCard {
+            rarity: String::new(),
             name: name.to_string(),
             mana_cost: Some("{1}{R}".to_string()),
             colors: vec!["R".to_string()],

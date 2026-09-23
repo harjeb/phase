@@ -353,6 +353,7 @@ fn tracked_by_source_face_down_exile_stays_hidden_from_controller() {
 #[test]
 fn real_hideaway_card_synthesizes_etb_trigger() {
     let atomic = AtomicCard {
+        rarity: String::new(),
         name: "Windbrisk Heights".to_string(),
         mana_cost: None,
         colors: Vec::new(),

@@ -1382,6 +1382,27 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
         return;
     }
 
+    // Pre-M10 combat damage is neither a spell nor an ability. Its assignments
+    // resolve without target selection, fizzling, or an arbitrary spell target.
+    if let StackEntryKind::CombatDamage {
+        sub_step,
+        assignments,
+    } = &entry.kind
+    {
+        super::combat_damage::resolve_stacked_combat_damage(state, assignments, *sub_step, events);
+        events.push(GameEvent::StackResolved {
+            object_id: entry.id,
+        });
+        if state.pending_combat_lifelink.is_none() {
+            finish_resolving_stack_entry(
+                state,
+                super::lifecycle::DelayedTerminalDisposition::Resolved,
+            );
+            state.resolution_source_relatch = None;
+        }
+        return;
+    }
+
     // CR 603.4: the intervening-if recheck lives inside `bind_resolution_scope`; a `false`
     // return means the condition failed and this entry resolves with no effect. The
     // SETTLEMENT stays HERE, at the caller, and must never move into the helper:
@@ -1424,19 +1445,9 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
         StackEntryKind::KeywordAction { .. } => unreachable!(
             "KeywordAction stack entries are resolved via the early-return branch above"
         ),
-        // Nothing constructs a `CombatDamage` entry in production yet: it has no
-        // push authority until combat-damage-on-the-stack timing lands, and at
-        // that point it gains its own early-return resolver ahead of this match,
-        // exactly as `KeywordAction` has. Until then no state can reach here.
-        // Unreachable on two independent grounds, and the second is what an
-        // earlier revision of this arm was missing: no phase before the pushing
-        // one constructs this kind, AND `PersistedGameState::prepare_for_restore`
-        // refuses to admit a decoded state that carries one. Without that second
-        // guard a deserialized entry could reach here, which is why "nothing
-        // constructs one" was not sufficient on its own.
-        StackEntryKind::CombatDamage { .. } => unreachable!(
-            "CombatDamage stack entries are refused at persisted admission and never pushed in this phase"
-        ),
+        StackEntryKind::CombatDamage { .. } => {
+            unreachable!("combat damage is resolved by the typed early-return branch")
+        }
     };
 
     // CR 608.2c + CR 400.7a + CR 613.1b: "The controller of the spell or ability follows

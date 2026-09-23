@@ -98,6 +98,10 @@ impl GameDb {
                 session_json TEXT NOT NULL,
                 updated_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS native_tournaments (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                manager_json TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS p2p_draft_backups (
                 draft_code TEXT PRIMARY KEY,
                 host_peer_id TEXT NOT NULL,
@@ -828,6 +832,40 @@ impl GameDb {
             params![now_epoch(), delivery_id.0, verifier(&credential.0)],
         )?;
         Ok(changed == 1)
+    }
+
+    /// Replace the tournament authority atomically, before publishing its broker outbounds.
+    pub fn save_tournaments(&self, manager: &lobby_broker::TournamentManager) -> Result<(), String> {
+        let json = serde_json::to_string(manager).map_err(|error| error.to_string())?;
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO native_tournaments (singleton, manager_json) VALUES (1, ?1)
+                 ON CONFLICT(singleton) DO UPDATE SET manager_json = excluded.manager_json",
+                [&json],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// A malformed existing authority is an error, never an empty replacement tournament list.
+    pub fn load_tournaments(&self) -> Result<lobby_broker::TournamentManager, String> {
+        let json: Option<String> = self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT manager_json FROM native_tournaments WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        match json {
+            Some(json) => serde_json::from_str(&json).map_err(|error| error.to_string()),
+            None => Ok(lobby_broker::TournamentManager::new()),
+        }
     }
 
     // ── Draft session persistence ──────────────────────────────────────────
