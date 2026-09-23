@@ -4895,6 +4895,7 @@ mod tests {
                             },
                             position: crate::types::ability::LibraryPosition::Top,
                             face_down: false,
+                            actor: crate::types::ability::LibraryInstructionActor::LibraryPlayer,
                         },
                     ))
                     .description("Crumbling Sanctuary prevention shield".to_string()),
@@ -4932,6 +4933,7 @@ mod tests {
             state.objects.get(&first).map(|obj| obj.zone),
             Some(Zone::Exile)
         );
+        assert_eq!(state.objects[&first].exiled_by, Some(PlayerId(1)));
         assert_eq!(
             state.objects.get(&second).map(|obj| obj.zone),
             Some(Zone::Exile)

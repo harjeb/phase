@@ -3166,6 +3166,8 @@ pub(crate) fn try_parse_exile_cast_permission(text: &str, lower: &str) -> Option
             // CR 122.1 + CR 614.1c: linked enters-with counter rider peeled off
             // the trailing text above (Intrepid Paleontologist — finality).
             enters_with_counter,
+            // CR 406.6: "you may cast" — the source's controller is the grantee.
+            grantee: ExileCastGrantee::SourceController,
         })
         .affected(filter)
         .description(text.to_string()),
@@ -3217,38 +3219,50 @@ pub(crate) fn try_parse_persistent_exile_play_permission(
     let uses_anaphor = after_look.is_some();
     let rest = after_look.unwrap_or(rest);
 
+    // CR 406.6 + CR 607.1: The permission's subject names its grantee — "you
+    // may …" grants the source's controller the whole pool; "each player may …
+    // cards they exiled with ~" (Uba Mask) grants every player the pool cards
+    // they exiled. The look-at preamble is a "you" shape only, so its anaphoric
+    // play clause stays controller-scoped.
+    let (rest, grantee) = if uses_anaphor {
+        (
+            nom_tag_lower(rest, rest, "you may ")?,
+            ExileCastGrantee::SourceController,
+        )
+    } else {
+        parse_exile_play_grantee(rest).ok()?
+    };
+
     // Core permission phrase. CR 305.1: "play lands and cast spells" / "play
     // cards" lower to Play mode (lands are played, non-land cards are cast).
     // CR 601.2a: the bare "cast cards exiled with ~" wording (Azula, Cunning
     // Usurper) is spell-cast only and lowers to `Cast` — lands cannot be
     // "cast", so the Cast branch never admits exiled lands.
-    let (after_clause, play_mode) = if let Some(rest) =
-        nom_tag_lower(rest, rest, "you may play lands and cast spells from among ")
-    {
-        // The play clause either names the source ("cards exiled with <self>") or
-        // refers back to the look-at preamble's set ("those cards").
-        let rest = if uses_anaphor {
-            nom_tag_lower(rest, rest, "those cards")?
-        } else {
-            strip_exile_play_source_reference(rest)?
-        };
-        (rest, CardPlayMode::Play)
-    } else if let Some(rest) = nom_tag_lower(rest, rest, "you may cast ") {
-        // CR 601.2a: "you may cast cards exiled with ~" — spell-cast only.
-        let rest = if uses_anaphor {
-            nom_tag_lower(rest, rest, "those cards")?
-        } else {
-            strip_exile_play_source_reference(rest)?
-        };
-        (rest, CardPlayMode::Cast)
+    let (rest, play_mode) = alt((
+        value(
+            CardPlayMode::Play,
+            tag::<_, _, OracleError<'_>>("play lands and cast spells from among "),
+        ),
+        value(CardPlayMode::Cast, tag("cast ")),
+        value(CardPlayMode::Play, tag("play ")),
+    ))
+    .parse(rest)
+    .ok()?;
+    // The play clause either names the source ("cards [they ]exiled with
+    // <self>") or refers back to the look-at preamble's set ("those cards").
+    let after_clause = if uses_anaphor {
+        nom_tag_lower(rest, rest, "those cards")?
     } else {
-        let rest = nom_tag_lower(rest, rest, "you may play ")?;
-        let rest = if uses_anaphor {
-            nom_tag_lower(rest, rest, "those cards")?
-        } else {
-            strip_exile_play_source_reference(rest)?
-        };
-        (rest, CardPlayMode::Play)
+        strip_exile_play_source_reference(rest, grantee)?
+    };
+
+    // CR 406.6: An optional "this turn" bound (Uba Mask: "…exiled with ~ this
+    // turn") scopes the pool to the per-turn rolling list, so cards exiled on
+    // an earlier turn are no longer playable; without it the lifetime
+    // `exile_links` pool applies.
+    let (after_clause, pool) = match nom_tag_lower(after_clause, after_clause, " this turn") {
+        Some(rest) => (rest, ExileCardPool::ThisTurn),
+        None => (after_clause, ExileCardPool::Persistent),
     };
 
     // CR 601.3b + CR 609.4b: Optional payment/timing-concession riders that ride
@@ -3289,8 +3303,9 @@ pub(crate) fn try_parse_persistent_exile_play_permission(
         play_mode,
         // CR 305.1 / CR 601.3: Cards are played/cast at their normal cost.
         cost: ExileCastCost::PayNormalCost,
-        // CR 406.6: Lifetime per-source exile-link pool.
-        pool: ExileCardPool::Persistent,
+        // CR 406.6: Lifetime per-source exile-link pool, or the per-turn list
+        // when the reference is bounded by "this turn".
+        pool,
         timing,
         mana_spend_permission,
         grants_flash,
@@ -3302,6 +3317,7 @@ pub(crate) fn try_parse_persistent_exile_play_permission(
         // class. Left `None`; the shared recognizer would slot here if such a
         // card ships.
         enters_with_counter: None,
+        grantee,
     })
     // CR 305.1: The permission applies to every card in the source's exile
     // pool; the pool itself is the scope, so no type/MV constraint.
@@ -3363,10 +3379,31 @@ fn strip_leading_permission_condition(input: &str) -> Option<(&str, StaticCondit
     Some((rest, condition))
 }
 
-fn strip_exile_play_source_reference(rest: &str) -> Option<&str> {
-    let after_anchor = nom_tag_lower(rest, rest, "cards exiled with ")
-        .or_else(|| nom_tag_lower(rest, rest, "the cards exiled with "))?;
+fn strip_exile_play_source_reference(rest: &str, grantee: ExileCastGrantee) -> Option<&str> {
+    let after_anchor = match grantee {
+        ExileCastGrantee::SourceController => nom_tag_lower(rest, rest, "cards exiled with ")
+            .or_else(|| nom_tag_lower(rest, rest, "the cards exiled with "))?,
+        // CR 406.6: "cards they exiled with <self>" — the per-player share of
+        // the source's pool, bound to the "each player" subject.
+        ExileCastGrantee::EachPlayerOwnExiles => {
+            nom_tag_lower(rest, rest, "cards they exiled with ")?
+        }
+    };
     strip_self_reference(after_anchor)
+}
+
+/// CR 406.6 + CR 607.1: Parse the grantee subject of an exile-play permission:
+/// "you may " → the source's controller; "each player may " → every player,
+/// each for the cards they exiled (Uba Mask).
+fn parse_exile_play_grantee(input: &str) -> OracleResult<'_, ExileCastGrantee> {
+    alt((
+        value(ExileCastGrantee::SourceController, tag("you may ")),
+        value(
+            ExileCastGrantee::EachPlayerOwnExiles,
+            tag("each player may "),
+        ),
+    ))
+    .parse(input)
 }
 
 /// CR 601.3f + CR 113.6b: Strip the "you may look at cards exiled with
