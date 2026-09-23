@@ -9830,6 +9830,7 @@ mod tests {
                     display_name: "Insect".to_string(),
                     power: Some(1),
                     toughness: Some(1),
+                    loyalty: None,
                     core_types: vec![CoreType::Creature],
                     subtypes: vec!["Insect".to_string()],
                     supertypes: vec![],

@@ -19719,6 +19719,10 @@ fn try_split_targeted_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
             // self-reference so a `"that creature"` copy-token anaphor in the
             // continuation chunk still remaps to the enchanted host.
             host_self_reference: ctx.host_self_reference.clone(),
+            // CR 109.1 + CR 205.2: a continuation chunk is still the enclosing
+            // card's text, so its printed core types travel with it (CR 701.41a
+            // `support N` reads them).
+            source_core_types: ctx.source_core_types.clone(),
             ..Default::default()
         }
     } else {
@@ -33458,6 +33462,7 @@ fn rebind_event_context_amount_counts(effect: &mut Effect, gate_qty: &QuantityRe
         | Effect::RuntimeHandled { .. }
         | Effect::Incubate { .. }
         | Effect::Amass { .. }
+        | Effect::EmpowerJace { .. }
         | Effect::Monstrosity { .. }
         | Effect::Renown { .. }
         | Effect::Bolster { .. }
@@ -38977,6 +38982,12 @@ pub(crate) fn parse_effect_chain_ir(
             // self-reference so a `"that creature"` copy-token anaphor in any
             // chunk of an Aura/bestow card remaps to the enchanted host.
             host_self_reference: ctx.host_self_reference.clone(),
+            // CR 109.1 + CR 205.2: every chunk of a chain is still the enclosing
+            // card's text, so the card's printed core types travel with it.
+            // CR 701.41a `support N` reads them to pick the "other"/"any" branch
+            // of its expansion; this context is minted field-by-field rather than
+            // cloned, so anything card-scoped not listed here is silently lost.
+            source_core_types: ctx.source_core_types.clone(),
             // CR 608.2c + CR 608.2k + CR 406.6: the plural-anaphor antecedent
             // introduced by the trigger's intervening-if ("if there are cards
             // exiled with ~") is a property of the whole trigger body, not of
@@ -39347,6 +39358,7 @@ pub(crate) fn parse_effect_chain_ir(
                 .where_x_expression(where_x_expression.clone())
                 .target_selection_mode(chunk_ctx.target_selection_mode)
                 .target_chooser(chunk_ctx.target_chooser.clone())
+                .declared_target_choice_timing(chunk_ctx.declared_target_choice_timing.take())
                 .printed_color_choice(chunk_ctx.pending_printed_color_choice.take())
                 .push();
             continue;
@@ -40602,6 +40614,7 @@ pub(crate) fn parse_effect_chain_ir(
                     .where_x_expression(where_x_expression)
                     .target_selection_mode(chunk_ctx.target_selection_mode)
                     .target_chooser(chunk_ctx.target_chooser.clone())
+                    .declared_target_choice_timing(chunk_ctx.declared_target_choice_timing.take())
                     .printed_color_choice(chunk_ctx.pending_printed_color_choice.take())
                     .push();
             }
@@ -40697,6 +40710,7 @@ pub(crate) fn parse_effect_chain_ir(
             .unless_pay(unless_pay)
             .target_selection_mode(chunk_ctx.target_selection_mode)
             .target_chooser(chunk_ctx.target_chooser.clone())
+            .declared_target_choice_timing(chunk_ctx.declared_target_choice_timing.take())
             .printed_color_choice(chunk_ctx.pending_printed_color_choice.take())
             .push();
 
