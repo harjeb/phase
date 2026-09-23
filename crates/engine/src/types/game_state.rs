@@ -13970,6 +13970,12 @@ pub enum WaitingFor {
     /// CR 608.2d: Player must choose whether to perform an optional effect ("You may X").
     OptionalEffectChoice {
         player: PlayerId,
+        /// Display-only identity of the single object this optional instruction
+        /// operates on. This is latched from the resolved ability; `source_id`
+        /// remains the ability source and the resolution authority remains the
+        /// parked optional-effect frame.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decision_subject_id: Option<ObjectId>,
         source_id: ObjectId,
         /// Human-readable description of the effect (e.g. "draw a card").
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -14023,6 +14029,11 @@ pub enum WaitingFor {
     /// Prompts opponents in APNAP order. First accept wins; remaining are not prompted.
     OpponentMayChoice {
         player: PlayerId,
+        /// Display-only, latched identity of the single object the opponents
+        /// are deciding about. Re-prompts preserve it unchanged; `source_id`
+        /// remains the ability source and provenance authority.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decision_subject_id: Option<ObjectId>,
         source_id: ObjectId,
         /// Human-readable description of the effect.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -28255,6 +28266,7 @@ mod forced_cascade_window_tests {
                 WaitingFor::OptionalEffectChoice {
                     player: PlayerId(0),
                     source_id: ObjectId(1),
+                    decision_subject_id: None,
                     description: None,
                     may_trigger_key: None,
                     same_card_may_trigger_choice_available: false,
