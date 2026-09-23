@@ -100,6 +100,11 @@ pub fn advance_phase(state: &mut GameState, events: &mut Vec<GameEvent>) {
             // replacement choice (Time Vault). `waiting_for` already holds the
             // prompt; stop advancing until the player answers.
             AdvancePhaseOnce::Paused => return,
+            // A cleanup-to-untap boundary is not allowed to consume any phase
+            // or turn state while a popped resolution carrier still owns the
+            // priority checkpoint. The engine priority pipeline will settle
+            // that carrier and retry the same boundary.
+            AdvancePhaseOnce::Deferred => return,
         }
     }
 }
@@ -128,12 +133,30 @@ pub(in crate::game) enum AdvancePhaseOnce {
     /// CR 614.1b: the turn start paused on an optional `BeginTurn` replacement
     /// choice (Time Vault). `state.waiting_for` holds the prompt to surface.
     Paused,
+    /// A live resolution carrier must settle before the Cleanup-to-Untap boundary.
+    Deferred,
 }
 
 pub(in crate::game) fn advance_phase_once(
     state: &mut GameState,
     events: &mut Vec<GameEvent>,
 ) -> AdvancePhaseOnce {
+    // Check before consuming an extra phase, running end-combat teardown, or
+    // mutating the outgoing turn. A nested resolution continuation can leave
+    // the stack empty while its popped carrier is still live; that is not a
+    // legal Cleanup -> Untap boundary. Return an inert result and let the
+    // owner pipeline settle the continuation before retrying.
+    let cleanup_wraps_to_untap = state.phase == Phase::Cleanup
+        && state
+            .extra_phases
+            .iter()
+            .rposition(|extra| extra.anchor == Phase::Cleanup)
+            .and_then(|index| state.extra_phases.get(index).map(|extra| extra.phase))
+            .unwrap_or(Phase::Untap)
+            == Phase::Untap;
+    if cleanup_wraps_to_untap && phase_transition_requires_settlement(state) {
+        return AdvancePhaseOnce::Deferred;
+    }
     // CR 500.8: Extra phases are inserted *directly after* their anchor phase
     // (e.g., Aurelia's "after this phase" extra combat is inserted after the
     // current combat phase ends — anchor = `EndCombat`). Consume only when
@@ -250,6 +273,24 @@ pub(in crate::game) fn advance_phase_once(
     }
 
     AdvancePhaseOnce::Entry(Box::new(enter_phase(state, next, events, apnap_anchor)))
+}
+
+/// A phase boundary must not retire a resolution owner or a typed continuation
+/// by reaching `start_next_turn` first.  Keep this predicate literal instead
+/// of relying on `GameState`'s loop-oriented `PartialEq`: these fields are
+/// decision/continuation identity even when they are intentionally omitted
+/// from that equality.
+pub(crate) fn phase_transition_requires_settlement(state: &GameState) -> bool {
+    state.resolving_stack_entry.is_some()
+        || state.resolving_trigger_firing.is_some()
+        || state.pending_resolution_completion.is_some()
+        || !state.resolution_stack.is_empty()
+        || state.active_ability_continuation().is_some()
+        || state.active_spell_resolution().is_some()
+        || state.pending_cast.is_some()
+        || state.pending_liminal_entry_resume.is_some()
+        || state.pending_token_battlefield_entry.is_some()
+        || !super::triggers::resolution_completion_can_settle(state)
 }
 
 /// CR 724.1d: End the current turn by skipping straight to the cleanup step.
@@ -1830,7 +1871,11 @@ pub fn begin_untap_or_subset_prompt(
     // `auto_advance` loop remains responsible for repeating through any
     // skipped successor, so a bounded prospective unit cannot inherit that
     // loop authority through this helper.
-    let _ = advance_phase_once(state, events);
+    match advance_phase_once(state, events) {
+        AdvancePhaseOnce::Deferred => return None,
+        AdvancePhaseOnce::Paused => return Some(state.waiting_for.clone()),
+        AdvancePhaseOnce::Entry(_) | AdvancePhaseOnce::Skipped => {}
+    }
     None
 }
 
@@ -3284,11 +3329,18 @@ fn process_phase_triggers(
 /// CR 800.4: Skip an eliminated active player's remaining turn through the
 /// normal Cleanup-to-next-turn transition. This intentionally shares the
 /// phase-entry pipeline rather than fabricating a replacement priority prompt.
-fn skip_eliminated_active_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
+fn skip_eliminated_active_turn(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+) -> AutoAdvanceStep {
     state.phase = Phase::Cleanup;
     // CR 800.4 + CR 500.5: Cleanup-to-Untap is one transition unit; any
     // subsequently skipped step remains work for the outer interpreter.
-    let _ = advance_phase_once(state, events);
+    match advance_phase_once(state, events) {
+        AdvancePhaseOnce::Deferred => AutoAdvanceStep::Deferred,
+        AdvancePhaseOnce::Paused => AutoAdvanceStep::waiting(state.waiting_for.clone()),
+        AdvancePhaseOnce::Entry(_) | AdvancePhaseOnce::Skipped => AutoAdvanceStep::Continue,
+    }
 }
 
 /// One production turn-interpreter iteration. The outer [`auto_advance`] loop
@@ -3298,6 +3350,7 @@ fn skip_eliminated_active_turn(state: &mut GameState, events: &mut Vec<GameEvent
 enum AutoAdvanceStep {
     Continue,
     Waiting(Box<WaitingFor>),
+    Deferred,
 }
 
 impl AutoAdvanceStep {
@@ -3311,6 +3364,7 @@ pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> Waiti
         match auto_advance_once(state, events) {
             AutoAdvanceStep::Continue => {}
             AutoAdvanceStep::Waiting(waiting_for) => return *waiting_for,
+            AutoAdvanceStep::Deferred => return state.waiting_for.clone(),
         }
     }
 }
@@ -3359,8 +3413,9 @@ fn auto_advance_once(state: &mut GameState, events: &mut Vec<GameEvent>) -> Auto
         // `elimination` has already pruned that seat's owed gains per-entry, so the
         // gains drained here belong to living controllers.
         //
-        // Placed HERE and not in `skip_eliminated_active_turn` (which returns `()`
-        // and would orphan a prompt the drain raises) and not in `enter_phase`
+        // Placed HERE and not in `skip_eliminated_active_turn` (which returns a
+        // turn-interpreter step and would orphan a prompt the drain raises) and
+        // not in `enter_phase`
         // (the shared funnel for all three abandonment doors, which cannot tell
         // this one from the CR 724.1a/724.2a doors that must NOT discharge).
         if state.pending_combat_lifelink.is_some() {
@@ -3392,8 +3447,7 @@ fn auto_advance_once(state: &mut GameState, events: &mut Vec<GameEvent>) -> Auto
                 }
             }
         }
-        skip_eliminated_active_turn(state, events);
-        return AutoAdvanceStep::Continue;
+        return skip_eliminated_active_turn(state, events);
     }
 
     match state.phase {
@@ -3421,11 +3475,23 @@ fn auto_advance_once(state: &mut GameState, events: &mut Vec<GameEvent>) -> Auto
                 return AutoAdvanceStep::Continue;
             }
             // CR 502.4 / CR 117.3a: No player receives priority during the untap step.
-            let _ = advance_phase_once(state, events);
+            match advance_phase_once(state, events) {
+                AdvancePhaseOnce::Deferred => return AutoAdvanceStep::Deferred,
+                AdvancePhaseOnce::Paused => {
+                    return AutoAdvanceStep::waiting(state.waiting_for.clone());
+                }
+                AdvancePhaseOnce::Entry(_) | AdvancePhaseOnce::Skipped => {}
+            }
         }
         Phase::Upkeep => {
             if should_skip_step_now(state, Phase::Upkeep) {
-                let _ = advance_phase_once(state, events);
+                match advance_phase_once(state, events) {
+                    AdvancePhaseOnce::Deferred => return AutoAdvanceStep::Deferred,
+                    AdvancePhaseOnce::Paused => {
+                        return AutoAdvanceStep::waiting(state.waiting_for.clone());
+                    }
+                    AdvancePhaseOnce::Entry(_) | AdvancePhaseOnce::Skipped => {}
+                }
                 return AutoAdvanceStep::Continue;
             }
             // CR 500.4 + CR 503.1: "As a step or phase begins, if there are
@@ -3505,7 +3571,13 @@ fn auto_advance_once(state: &mut GameState, events: &mut Vec<GameEvent>) -> Auto
                 && state.extra_phase_resume.is_empty())
                 || should_skip_step_now(state, Phase::Draw)
             {
-                let _ = advance_phase_once(state, events);
+                match advance_phase_once(state, events) {
+                    AdvancePhaseOnce::Deferred => return AutoAdvanceStep::Deferred,
+                    AdvancePhaseOnce::Paused => {
+                        return AutoAdvanceStep::waiting(state.waiting_for.clone());
+                    }
+                    AdvancePhaseOnce::Entry(_) | AdvancePhaseOnce::Skipped => {}
+                }
                 return AutoAdvanceStep::Continue;
             }
             if let Some(wf) = execute_draw(state, events) {
@@ -3701,10 +3773,19 @@ fn auto_advance_once(state: &mut GameState, events: &mut Vec<GameEvent>) -> Auto
         }
         Phase::Cleanup => {
             // CR 514: Cleanup step — discard to hand size (CR 514.1), remove damage and expire effects (CR 514.2).
+            if phase_transition_requires_settlement(state) {
+                return AutoAdvanceStep::Deferred;
+            }
             if let Some(waiting) = execute_cleanup(state, events) {
                 return AutoAdvanceStep::waiting(waiting);
             }
-            let _ = advance_phase_once(state, events);
+            match advance_phase_once(state, events) {
+                AdvancePhaseOnce::Deferred => return AutoAdvanceStep::Deferred,
+                AdvancePhaseOnce::Paused => {
+                    return AutoAdvanceStep::waiting(state.waiting_for.clone());
+                }
+                AdvancePhaseOnce::Entry(_) | AdvancePhaseOnce::Skipped => {}
+            }
             // advance_phase_once handles start_next_turn when wrapping Cleanup -> Untap
             // Continue loop to process next turn's phases
         }
@@ -3966,13 +4047,19 @@ mod tests {
         let expected_waiting = auto_advance(&mut production, &mut production_events);
 
         let mut one_unit_events = Vec::new();
-        assert!(matches!(
-            auto_advance_once(&mut one_unit, &mut one_unit_events),
-            AutoAdvanceStep::Continue
-        ));
+        match auto_advance_once(&mut one_unit, &mut one_unit_events) {
+            AutoAdvanceStep::Continue => {}
+            AutoAdvanceStep::Waiting(_) => {
+                panic!("untap must advance before surfacing its Priority window")
+            }
+            AutoAdvanceStep::Deferred => {
+                panic!("an uncontended untap boundary must not defer")
+            }
+        }
         let actual_waiting = match auto_advance_once(&mut one_unit, &mut one_unit_events) {
             AutoAdvanceStep::Continue => panic!("upkeep must surface a Priority window"),
             AutoAdvanceStep::Waiting(waiting_for) => *waiting_for,
+            AutoAdvanceStep::Deferred => panic!("an uncontended upkeep boundary must not defer"),
         };
 
         assert_eq!(actual_waiting, expected_waiting);
