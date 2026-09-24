@@ -5266,6 +5266,9 @@ pub(super) fn handle_resolution_choice(
             {
                 match turns::advance_phase_once(state, events) {
                     turns::AdvancePhaseOnce::Deferred => {}
+                    // The optional BeginTurn replacement owns the installed
+                    // prompt; return it without advancing the turn again.
+                    turns::AdvancePhaseOnce::Paused => {}
                     turns::AdvancePhaseOnce::Entry(_) | turns::AdvancePhaseOnce::Skipped => {
                         let advanced = turns::auto_advance(state, events);
                         public_state::sync_waiting_for(state, &advanced);

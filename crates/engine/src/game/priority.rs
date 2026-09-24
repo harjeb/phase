@@ -146,6 +146,9 @@ pub(crate) fn handle_priority_pass_with_limit(
                 // CR 117.4: Empty stack — advance to next phase.
                 match turns::advance_phase_once(state, events) {
                     turns::AdvancePhaseOnce::Deferred => {}
+                    // An optional turn-start replacement has already installed
+                    // its choice; auto_advance surfaces that pending prompt.
+                    turns::AdvancePhaseOnce::Paused => {}
                     turns::AdvancePhaseOnce::Entry(_) | turns::AdvancePhaseOnce::Skipped => {}
                 }
                 let (waiting_for, cleanup_deferred) =

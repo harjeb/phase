@@ -8660,6 +8660,72 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_waits_for_resolution_then_surfaces_optional_begin_turn_choice() {
+        use crate::types::game_state::PendingResolutionCompletion;
+        use crate::types::replacements::ReplacementEvent;
+
+        let mut state = setup();
+        state.phase = Phase::Cleanup;
+        state.active_player = PlayerId(0);
+        let vault = create_object(
+            &mut state,
+            CardId(99),
+            PlayerId(1),
+            "Time Vault".to_string(),
+            Zone::Battlefield,
+        );
+        let parsed = crate::parser::parse_oracle_text(
+            "If you would begin your turn while Time Vault is tapped, you may skip that turn instead. If you do, untap Time Vault.",
+            "Time Vault",
+            &[],
+            &["Artifact".to_string()],
+            &[],
+        );
+        assert!(parsed
+            .replacements
+            .iter()
+            .any(|def| def.event == ReplacementEvent::BeginTurn));
+        let vault_obj = state.objects.get_mut(&vault).unwrap();
+        vault_obj.tapped = true;
+        vault_obj.replacement_definitions = parsed.replacements.into();
+
+        state.pending_resolution_completion = Some(PendingResolutionCompletion {
+            player: PlayerId(0),
+            source_id: vault,
+            final_cast: None,
+        });
+        let mut events = Vec::new();
+        assert!(matches!(
+            advance_phase_once(&mut state, &mut events),
+            AdvancePhaseOnce::Deferred
+        ));
+        assert_eq!(state.phase, Phase::Cleanup);
+        assert_eq!(state.turn_number, 1);
+        assert_eq!(state.active_player, PlayerId(0));
+        assert!(events.is_empty());
+
+        state.pending_resolution_completion = None;
+        assert!(matches!(
+            advance_phase_once(&mut state, &mut events),
+            AdvancePhaseOnce::Paused
+        ));
+        assert_eq!(state.phase, Phase::Cleanup);
+        assert_eq!(state.turn_number, 2);
+        assert_eq!(state.active_player, PlayerId(1));
+        let prompt = state.waiting_for.clone();
+        assert!(matches!(
+            prompt,
+            WaitingFor::ReplacementChoice {
+                player: PlayerId(1),
+                ..
+            }
+        ));
+        assert_eq!(auto_advance(&mut state, &mut events), prompt);
+        assert_eq!(state.phase, Phase::Cleanup);
+        assert_eq!(state.turn_number, 2);
+    }
+
+    #[test]
     fn start_next_turn_resets_spells_cast_this_turn() {
         let mut state = setup();
         state.spells_cast_this_turn = 3;
