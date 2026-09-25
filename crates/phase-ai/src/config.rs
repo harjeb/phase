@@ -371,6 +371,12 @@ pub struct PolicyPenalties {
     /// Penalty multiplier for overextending when opponent likely has board wipe.
     #[serde(default = "default_threat_wipe_overextend_penalty")]
     pub threat_wipe_overextend_penalty: f64,
+    /// Penalty for concentrating the AI's board in a single creature that the
+    /// opponent can afford to remove this turn. Scaled by `targeted_removal` and
+    /// by the share of the AI's creature value held by its best creature, so a
+    /// wide board is untouched. Consumed by `PlannerServices::threat_adjustment`.
+    #[serde(default = "default_threat_removal_exposure_penalty")]
+    pub threat_removal_exposure_penalty: f64,
     /// Bonus prior when a candidate action progresses a combo line that is
     /// reachable this turn. Consumed by `ComboLinePolicy`.
     #[serde(default = "default_combo_progress_this_turn_bonus")]
@@ -689,6 +695,7 @@ impl Default for PolicyPenalties {
             synergy_casting_bonus: default_synergy_casting_bonus(),
             threat_counter_tapout_penalty: default_threat_counter_tapout_penalty(),
             threat_wipe_overextend_penalty: default_threat_wipe_overextend_penalty(),
+            threat_removal_exposure_penalty: default_threat_removal_exposure_penalty(),
             combo_progress_this_turn_bonus: default_combo_progress_this_turn_bonus(),
             combo_progress_next_turn_bonus: default_combo_progress_next_turn_bonus(),
             own_chalice_counter_penalty: default_own_chalice_counter_penalty(),
@@ -976,6 +983,9 @@ fn default_threat_counter_tapout_penalty() -> f64 {
 fn default_threat_wipe_overextend_penalty() -> f64 {
     -0.6
 }
+fn default_threat_removal_exposure_penalty() -> f64 {
+    -2.0
+}
 fn default_combo_progress_this_turn_bonus() -> f64 {
     15.0
 }
@@ -1261,6 +1271,12 @@ pub const UNTUNED_POLICY_PENALTY_FIELDS: &[(&str, &str)] = &[
     (
         "self_cost_material_life",
         "veto threshold, not a rate — SelfCostValuePolicy's trivial-payoff materiality bound is a life COUNT in i32, so the continuous [-15.0, 15.0] penalties vector CMA-ES optimizes cannot carry it at all; promotion would need a discrete search, not a paired-seed rerun",
+    ),
+    (
+        "threat_removal_exposure_penalty",
+        "eval-level threat term consuming `targeted_removal`, a signal no shipped \
+         configuration had read before; seeded conservatively and awaiting a \
+         paired-seed ai-gate calibration before joining the CMA-ES vector",
     ),
 ];
 
