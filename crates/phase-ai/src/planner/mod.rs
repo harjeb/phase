@@ -19,7 +19,8 @@ use crate::card_hints::should_play_now_with_facts;
 use crate::cast_facts::cast_facts_for_action;
 use crate::config::{AiConfig, OpponentModel};
 use crate::eval::{
-    evaluate_for_planner, evaluate_state, strategic_intent, threat_level, StrategicIntent,
+    evaluate_creature, evaluate_for_planner, evaluate_state, strategic_intent, threat_level,
+    StrategicIntent,
 };
 use crate::policies::context::{PolicyContext, PriorsEnv, SearchDepth};
 use crate::policies::PolicyRegistry;
@@ -539,6 +540,25 @@ const TT_CAPACITY: usize = 4096;
 /// difficulty/platform (see `config.rs`), so 8 leaves ample margin; killers
 /// recorded past this ply are simply not tracked (inert, never wrong).
 const MAX_KILLER_PLY: usize = 8;
+
+/// Minimum share of the AI's creature value that must sit in its single best
+/// creature before `threat_adjustment` prices targeted-removal exposure.
+///
+/// A generic removal probability applied to every board state is a systematic
+/// development tax; `combat_ai.rs`'s `MAX_TRICK_FLIP` note records that exact
+/// regression (`enchantress-mirror`). This floor is what keeps wide boards out
+/// of the scoped term below.
+const REMOVAL_EXPOSURE_CONCENTRATION_FLOOR: f64 = 0.5;
+
+/// Minimum untapped mana an opponent must hold before removal exposure is priced.
+/// The shipped `ArchetypeOnly` profile carries no mana-value data, so this is its
+/// only affordability signal; `Full` additionally requires the cheapest removal
+/// in the opponent's pool to be castable.
+const REMOVAL_LIVE_MANA: u32 = 1;
+
+/// Price exposure only when the profile considers removal likely enough to
+/// matter, mirroring the `> 0.3` / `> 0.2` gates on the sibling threat terms.
+const REMOVAL_EXPOSURE_RISK_FLOOR: f64 = 0.2;
 
 /// Per-rung iterative-deepening witness: did the depth-N rung complete, and how
 /// much of its node budget it consumed. AI-local search-*quality* record (not an
@@ -1083,22 +1103,56 @@ impl<'a> PlannerServices<'a> {
             adjustment += penalties.threat_counter_tapout_penalty * probs.counterspell;
         }
 
+        // One pass over the AI's creatures: the board-wipe overextension count
+        // and the targeted-removal concentration profile share it.
+        let mut ai_creatures = 0usize;
+        let mut best_creature_value = 0.0f64;
+        let mut total_creature_value = 0.0f64;
+        for &id in &state.battlefield {
+            let is_ai_creature = state.objects.get(&id).is_some_and(|obj| {
+                obj.controller == self.ai_player
+                    && obj
+                        .card_types
+                        .core_types
+                        .contains(&engine::types::card_type::CoreType::Creature)
+            });
+            if !is_ai_creature {
+                continue;
+            }
+            let value = evaluate_creature(state, id);
+            ai_creatures += 1;
+            total_creature_value += value;
+            best_creature_value = best_creature_value.max(value);
+        }
+
         // Penalize overextending when opponent likely has board wipe.
-        let ai_creatures = state
-            .battlefield
-            .iter()
-            .filter(|&&id| {
-                state.objects.get(&id).is_some_and(|obj| {
-                    obj.controller == self.ai_player
-                        && obj
-                            .card_types
-                            .core_types
-                            .contains(&engine::types::card_type::CoreType::Creature)
-                })
-            })
-            .count();
         if ai_creatures >= 3 && probs.board_wipe > 0.2 {
             adjustment += penalties.threat_wipe_overextend_penalty * probs.board_wipe;
+        }
+
+        // Penalize concentrating the AI's board in one creature the opponent can
+        // afford to remove this turn. `targeted_removal` was computed by the threat
+        // profile but read by no shipped configuration; this is its first consumer.
+        //
+        // Guarded so it can only nudge, never veto: it needs (a) a removal
+        // probability above the sibling-term floor, (b) an opponent with removal
+        // mana untapped, and (c) a CONCENTRATED board — the best creature holds at
+        // least `REMOVAL_EXPOSURE_CONCENTRATION_FLOOR` of the AI's creature value,
+        // so a wide board is out of scope.
+        if probs.targeted_removal > REMOVAL_EXPOSURE_RISK_FLOOR && total_creature_value > 0.0 {
+            let removal_live = players::opponents(state, self.ai_player)
+                .iter()
+                .any(|&opp| {
+                    let mana = crate::zone_eval::available_mana(state, opp);
+                    mana >= REMOVAL_LIVE_MANA
+                        && mana >= threat.category_pools.targeted_removal.min_mana_value
+                });
+            let concentration = best_creature_value / total_creature_value;
+            if removal_live && concentration >= REMOVAL_EXPOSURE_CONCENTRATION_FLOOR {
+                adjustment += penalties.threat_removal_exposure_penalty
+                    * probs.targeted_removal
+                    * concentration;
+            }
         }
 
         adjustment
@@ -1865,6 +1919,119 @@ mod tests {
             (planner_eval_none - reconstructed_none).abs() < 1e-9,
             "serve reconstruction (no threat) diverged: planner={planner_eval_none} \
              reconstructed={reconstructed_none}"
+        );
+    }
+
+    /// Adds a bare creature permanent controlled by `owner`.
+    fn add_body(state: &mut GameState, owner: PlayerId, power: i32, toughness: i32) -> ObjectId {
+        let card_id = CardId(state.next_object_id);
+        let id = create_object(state, card_id, owner, "Body".to_string(), Zone::Battlefield);
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Creature);
+        obj.power = Some(power);
+        obj.toughness = Some(toughness);
+        id
+    }
+
+    /// Adds a bare untapped Land controlled by `owner`, so `available_mana` sees it.
+    fn add_land(state: &mut GameState, owner: PlayerId) {
+        let card_id = CardId(state.next_object_id);
+        let id = create_object(state, card_id, owner, "Land".to_string(), Zone::Battlefield);
+        state
+            .objects
+            .get_mut(&id)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Land);
+    }
+
+    /// `targeted_removal` is the one threat category no shipped configuration
+    /// read before this term, so pin each gate and the zero pole by name:
+    /// risk floor, open removal mana, and board concentration. The wide-board arm
+    /// is the `enchantress-mirror` guard (`combat_ai.rs`'s `MAX_TRICK_FLIP`).
+    #[test]
+    fn removal_exposure_penalty_is_gated_by_concentration_and_open_mana() {
+        use crate::context::AiContext;
+        use crate::deck_profile::DeckArchetype;
+        use crate::threat_profile::{ThreatProbabilities, ThreatProfile};
+        use engine::game::DeckEntry;
+        use engine::types::card::CardFace;
+        use engine::types::card_type::CardType;
+
+        let deck: Vec<DeckEntry> = (0..4)
+            .map(|i| DeckEntry {
+                card: CardFace {
+                    name: format!("Bear {i}"),
+                    card_type: CardType {
+                        core_types: vec![CoreType::Creature],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                count: 4,
+            })
+            .collect();
+        let config = create_config(AiDifficulty::Hard, Platform::Native);
+        let policies = crate::policies::PolicyRegistry::shared();
+
+        // Isolates the term: the sibling threat terms need `counterspell` /
+        // `board_wipe`, which stay at `Default::default()` (0.0) here.
+        let adjustment = |state: &GameState, risk: f64| {
+            let mut ctx = AiContext::analyze_for_player(
+                &deck,
+                &config.weights,
+                &config.archetype_multipliers,
+                PlayerId(0),
+            );
+            ctx.opponent_threat = Some(ThreatProfile {
+                probabilities: ThreatProbabilities {
+                    targeted_removal: risk,
+                    ..Default::default()
+                },
+                opponent_archetype: DeckArchetype::Midrange,
+                category_pools: Default::default(),
+                pool_size: 0,
+                hand_size: 0,
+            });
+            PlannerServices::new(PlayerId(0), &config, policies, ctx).threat_adjustment(state)
+        };
+
+        // Concentrated board + opponent land untapped → priced.
+        let mut concentrated = make_state();
+        add_body(&mut concentrated, PlayerId(0), 5, 5);
+        add_land(&mut concentrated, PlayerId(1));
+        let priced = adjustment(&concentrated, 0.9);
+        assert!(
+            priced < 0.0,
+            "a concentrated board with removal mana up must be priced, got {priced}"
+        );
+        assert_eq!(
+            adjustment(&concentrated, 0.0),
+            0.0,
+            "the risk floor must zero the term"
+        );
+
+        // Same board, opponent fully tapped → not priced.
+        let mut opponent_tapped_out = make_state();
+        add_body(&mut opponent_tapped_out, PlayerId(0), 5, 5);
+        assert_eq!(
+            adjustment(&opponent_tapped_out, 0.9),
+            0.0,
+            "no untapped opponent mana must zero the term"
+        );
+
+        // Four equal bodies (best holds 0.25 of the AI's creature value) → not
+        // priced even with mana up.
+        let mut wide = make_state();
+        for _ in 0..4 {
+            add_body(&mut wide, PlayerId(0), 5, 5);
+        }
+        add_land(&mut wide, PlayerId(1));
+        assert_eq!(
+            adjustment(&wide, 0.9),
+            0.0,
+            "a wide board must stay outside the removal-exposure term"
         );
     }
 
