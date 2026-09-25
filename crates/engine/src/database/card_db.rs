@@ -7,7 +7,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use super::bracket_lists::{BracketLists, BracketSignals};
-use super::legality::{normalize_legalities, CardLegalities, LegalityFormat, LegalityStatus};
+use super::legality::{
+    legalities_to_export_map, normalize_legalities, CardLegalities, LegalityFormat, LegalityStatus,
+};
 use super::mtgjson::Ruling;
 use crate::types::card::{CardFace, CardRules, LayoutKind, PrintedCardRef};
 use crate::types::card_type::CoreType;
@@ -215,43 +217,73 @@ impl CardDatabase {
     /// Emit a card-data export JSON containing ONLY the named faces, suitable for
     /// `from_json_str`. Reconstructs each `CardExportEntry` from the in-memory
     /// indices. Legalities are intentionally empty: AI workers never run a
-    /// deck-legality check, and the built DB retains only the normalized
-    /// `legalities` form (there is no raw `HashMap<String, String>` source to
-    /// re-emit — see `from_export_entries`).
+    /// deck-legality check, and the key is dropped rather than paid for on every
+    /// card of a subset.
     pub fn export_subset_json(&self, names: &std::collections::BTreeSet<String>) -> String {
         let mut out: HashMap<String, CardExportEntry> = HashMap::with_capacity(names.len());
         for name in names {
             let key = self.lookup_key(name);
-            let Some(face) = self.face_index.get(&key) else {
+            let Some(mut entry) = self.export_entry(&key) else {
                 continue;
             };
-            let layout = face
-                .scryfall_oracle_id
-                .as_deref()
-                .and_then(|id| self.layout_index.get(id).copied())
-                .and_then(layout_kind_to_str)
-                .map(str::to_string);
-            let entry = CardExportEntry {
-                face: face.clone(),
-                legalities: HashMap::new(),
-                layout,
-                face_index: self.face_order_index.get(&key).copied(),
-                printings: self.printings_index.get(&key).cloned().unwrap_or_default(),
-                rulings: self.rulings_index.get(&key).cloned().unwrap_or_default(),
-                bracket_signals: self
-                    .bracket_signals_by_name
-                    .get(&key)
-                    .copied()
-                    .unwrap_or_default(),
-            };
-            // Preserve the database storage key, not merely the printed face
-            // name. Meld pairs have two distinct combined-back records with the
-            // same printed name and different oracle ids; oracle-gen keeps the
-            // loser under a hidden `[oracle-id]` key. Re-keying both by
-            // `face.name` here collapsed one half in AI-worker subsets.
+            entry.legalities.clear();
             out.insert(key, entry);
         }
         serde_json::to_string(&out).expect("CardExportEntry serialization is infallible")
+    }
+
+    /// Emit the full card-data export JSON for every stored face, legalities
+    /// included — the same document `oracle-gen` writes.
+    ///
+    /// `from_export` of this output rebuilds an equivalent database, which is
+    /// what lets a caller cache the Oracle-text parse instead of repeating it:
+    /// parsing raw MTGJSON costs minutes, re-reading this export costs seconds.
+    pub fn export_json(&self) -> String {
+        let mut out: HashMap<String, CardExportEntry> =
+            HashMap::with_capacity(self.face_index.len());
+        for key in self.face_index.keys() {
+            if let Some(entry) = self.export_entry(key) {
+                out.insert(key.clone(), entry);
+            }
+        }
+        serde_json::to_string(&out).expect("CardExportEntry serialization is infallible")
+    }
+
+    /// One export record rebuilt from the in-memory indices. Legalities are
+    /// mapped back to MTGJSON strings so a round trip through `from_export` is
+    /// lossless (the built DB only retains the normalized `CardLegalities`).
+    ///
+    /// The key is the database storage key, not the printed face name: meld
+    /// pairs have two distinct combined-back records with the same printed name
+    /// and different oracle ids, and oracle-gen keeps the loser under a hidden
+    /// `[oracle-id]` key. Re-keying both by `face.name` collapsed one half in
+    /// AI-worker subsets.
+    fn export_entry(&self, key: &str) -> Option<CardExportEntry> {
+        let face = self.face_index.get(key)?;
+        let layout = face
+            .scryfall_oracle_id
+            .as_deref()
+            .and_then(|id| self.layout_index.get(id).copied())
+            .and_then(layout_kind_to_str)
+            .map(str::to_string);
+        Some(CardExportEntry {
+            face: face.clone(),
+            legalities: self
+                .legalities
+                .get(key)
+                .map(legalities_to_export_map)
+                .map(|map| map.into_iter().collect())
+                .unwrap_or_default(),
+            layout,
+            face_index: self.face_order_index.get(key).copied(),
+            printings: self.printings_index.get(key).cloned().unwrap_or_default(),
+            rulings: self.rulings_index.get(key).cloned().unwrap_or_default(),
+            bracket_signals: self
+                .bracket_signals_by_name
+                .get(key)
+                .copied()
+                .unwrap_or_default(),
+        })
     }
 
     /// Resolve a face by its Scryfall oracle id. Used as a fallback when a
@@ -1103,6 +1135,56 @@ mod tests {
             db.legality_status("Test Card", LegalityFormat::Premodern),
             Some(LegalityStatus::Banned)
         );
+    }
+
+    #[test]
+    fn export_json_round_trips_every_face_and_its_legalities() {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "test card".to_string(),
+            serde_json::json!({
+                "name": "Test Card",
+                "mana_cost": { "type": "NoCost" },
+                "card_type": { "supertypes": [], "core_types": [], "subtypes": [] },
+                "power": null,
+                "toughness": null,
+                "loyalty": null,
+                "defense": null,
+                "oracle_text": null,
+                "non_ability_text": null,
+                "flavor_name": null,
+                "keywords": [],
+                "abilities": [],
+                "triggers": [],
+                "static_abilities": [],
+                "replacements": [],
+                "color_override": null,
+                "scryfall_oracle_id": null,
+                "legalities": {
+                    "standard": "Legal",
+                    "premodern": "Banned"
+                }
+            }),
+        );
+        let db = CardDatabase::from_json_str(&serde_json::Value::Object(map).to_string()).unwrap();
+
+        let again = CardDatabase::from_json_str(&db.export_json()).unwrap();
+
+        assert!(again.get_face_by_name("Test Card").is_some());
+        assert_eq!(
+            again.legality_status("Test Card", LegalityFormat::Standard),
+            Some(LegalityStatus::Legal)
+        );
+        assert_eq!(
+            again.legality_status("Test Card", LegalityFormat::Premodern),
+            Some(LegalityStatus::Banned)
+        );
+
+        // The AI-worker subset contract still strips legalities.
+        let names: std::collections::BTreeSet<String> = ["Test Card".to_string()].into();
+        let subset = CardDatabase::from_json_str(&db.export_subset_json(&names)).unwrap();
+        assert!(subset.get_face_by_name("Test Card").is_some());
+        assert!(subset.get_legalities("Test Card").is_none());
     }
 
     #[test]
