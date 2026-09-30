@@ -150,7 +150,7 @@ const COMBO_PIECE_TUTOR_BONUS: f64 = 1.5;
 /// non-cEDH boards (combos with their normal pieces missing show up too,
 /// but the names match cEDH staples — false positives are bounded by the
 /// registry's curation).
-fn combo_missing_piece_names(state: &GameState, ai_player: PlayerId) -> HashSet<&'static str> {
+fn combo_missing_piece_names(state: &GameState, ai_player: PlayerId) -> HashSet<&str> {
     let registry = crate::combo::ComboRegistry::default();
     registry
         .missing_pieces_for_near_reachable_lines(state, ai_player)
@@ -644,6 +644,11 @@ mod tests {
             .core_types
             .push(CoreType::Creature);
 
+        engine::game::printed_cards::apply_card_face_to_object(
+            state.objects.get_mut(&heliod).unwrap(),
+            &crate::combo::tests::card("heliod, sun-crowned"),
+        );
+
         // The library candidates: a generic flying 6/6 (high tutor score) and
         // Walking Ballista (the missing combo piece, a 0/0 by default).
         let titan = create_object(
@@ -676,6 +681,10 @@ mod tests {
             .push(CoreType::Creature);
 
         let titan_score = score_search_choice_selection(&state, PlayerId(0), &[titan]);
+        engine::game::printed_cards::apply_card_face_to_object(
+            state.objects.get_mut(&ballista).unwrap(),
+            &crate::combo::tests::card("walking ballista"),
+        );
         let ballista_score = score_search_choice_selection(&state, PlayerId(0), &[ballista]);
 
         assert!(

@@ -609,17 +609,15 @@ mod tests {
                 vec![CoreType::Land],
             ));
         }
-        hand.push(add_hand_card(
+        hand.push(crate::combo::tests::place(
             &mut state,
-            10,
-            "Thassa's Oracle",
-            vec![CoreType::Creature],
+            &crate::combo::tests::card("thassa's oracle"),
+            engine::types::zones::Zone::Hand,
         ));
-        hand.push(add_hand_card(
+        hand.push(crate::combo::tests::place(
             &mut state,
-            11,
-            "Demonic Consultation",
-            vec![CoreType::Instant],
+            &crate::combo::tests::card("demonic consultation"),
+            engine::types::zones::Zone::Hand,
         ));
 
         let score = policy.evaluate(

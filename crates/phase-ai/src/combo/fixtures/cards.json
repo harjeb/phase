@@ -1,0 +1,850 @@
+{
+  "heliod, sun-crowned": {
+    "name": "Heliod, Sun-Crowned",
+    "mana_cost": {
+      "type": "Cost",
+      "shards": [
+        "White"
+      ],
+      "generic": 2
+    },
+    "card_type": {
+      "supertypes": [
+        "Legendary"
+      ],
+      "core_types": [
+        "Enchantment",
+        "Creature"
+      ],
+      "subtypes": [
+        "God"
+      ]
+    },
+    "power": {
+      "type": "Fixed",
+      "value": 5
+    },
+    "toughness": {
+      "type": "Fixed",
+      "value": 5
+    },
+    "loyalty": null,
+    "defense": null,
+    "non_ability_text": null,
+    "flavor_name": null,
+    "keywords": [
+      "Indestructible"
+    ],
+    "abilities": [
+      {
+        "kind": "Activated",
+        "effect": {
+          "type": "GenericEffect",
+          "static_abilities": [
+            {
+              "mode": "Continuous",
+              "affected": {
+                "type": "ParentTarget"
+              },
+              "modifications": [
+                {
+                  "type": "AddKeyword",
+                  "keyword": "Lifelink"
+                }
+              ],
+              "condition": null,
+              "affected_zone": null,
+              "effect_zone": null,
+              "active_zones": [],
+              "characteristic_defining": false,
+              "description": "gain lifelink"
+            }
+          ],
+          "duration": "UntilEndOfTurn",
+          "target": {
+            "type": "Typed",
+            "type_filters": [
+              "Creature"
+            ],
+            "controller": null,
+            "properties": [
+              {
+                "type": "Another"
+              }
+            ]
+          }
+        },
+        "cost": {
+          "type": "Mana",
+          "cost": {
+            "type": "Cost",
+            "shards": [
+              "White"
+            ],
+            "generic": 1
+          }
+        },
+        "sub_ability": null,
+        "duration": "UntilEndOfTurn",
+        "description": "{1}{W}: Another target creature gains lifelink until end of turn.",
+        "target_prompt": null,
+        "condition": null,
+        "optional_targeting": false,
+        "optional": false,
+        "forward_result": false
+      }
+    ],
+    "triggers": [
+      {
+        "mode": "LifeGained",
+        "execute": {
+          "kind": "Spell",
+          "effect": {
+            "type": "PutCounter",
+            "counter_type": "P1P1",
+            "count": {
+              "type": "Fixed",
+              "value": 1
+            },
+            "target": {
+              "type": "Or",
+              "filters": [
+                {
+                  "type": "Typed",
+                  "type_filters": [
+                    "Creature"
+                  ],
+                  "controller": "You",
+                  "properties": []
+                },
+                {
+                  "type": "Typed",
+                  "type_filters": [
+                    "Enchantment"
+                  ],
+                  "controller": "You",
+                  "properties": []
+                }
+              ]
+            }
+          },
+          "cost": null,
+          "sub_ability": null,
+          "duration": null,
+          "description": null,
+          "target_prompt": null,
+          "condition": null,
+          "optional_targeting": false,
+          "optional": false,
+          "forward_result": false
+        },
+        "valid_card": null,
+        "origin": null,
+        "destination": null,
+        "trigger_zones": [
+          "Battlefield"
+        ],
+        "phase": null,
+        "optional": false,
+        "damage_kind": "Any",
+        "secondary": false,
+        "valid_target": {
+          "type": "Controller"
+        },
+        "valid_source": null,
+        "description": "Whenever you gain life, put a +1/+1 counter on target creature or enchantment you control.",
+        "constraint": null,
+        "condition": null,
+        "batched": false
+      }
+    ],
+    "static_abilities": [
+      {
+        "mode": "Continuous",
+        "affected": {
+          "type": "SelfRef"
+        },
+        "modifications": [
+          {
+            "type": "RemoveType",
+            "core_type": "Creature"
+          }
+        ],
+        "condition": {
+          "type": "Not",
+          "condition": {
+            "type": "DevotionGE",
+            "colors": [
+              "White"
+            ],
+            "threshold": 5
+          }
+        },
+        "affected_zone": null,
+        "effect_zone": null,
+        "active_zones": [],
+        "characteristic_defining": false,
+        "description": "As long as your devotion to white is less than five, ~ isn't a creature."
+      }
+    ],
+    "replacements": [],
+    "color_override": null,
+    "color_identity": [
+      "White"
+    ],
+    "brawl_commander": true,
+    "is_commander": true
+  },
+  "walking ballista": {
+    "name": "Walking Ballista",
+    "mana_cost": {
+      "type": "Cost",
+      "shards": [
+        "X",
+        "X"
+      ],
+      "generic": 0
+    },
+    "card_type": {
+      "supertypes": [],
+      "core_types": [
+        "Artifact",
+        "Creature"
+      ],
+      "subtypes": [
+        "Construct"
+      ]
+    },
+    "power": {
+      "type": "Fixed",
+      "value": 0
+    },
+    "toughness": {
+      "type": "Fixed",
+      "value": 0
+    },
+    "loyalty": null,
+    "defense": null,
+    "non_ability_text": null,
+    "flavor_name": null,
+    "keywords": [],
+    "abilities": [
+      {
+        "kind": "Activated",
+        "effect": {
+          "type": "PutCounter",
+          "counter_type": "P1P1",
+          "count": {
+            "type": "Fixed",
+            "value": 1
+          },
+          "target": {
+            "type": "SelfRef"
+          }
+        },
+        "cost": {
+          "type": "Mana",
+          "cost": {
+            "type": "Cost",
+            "shards": [],
+            "generic": 4
+          }
+        },
+        "sub_ability": null,
+        "duration": null,
+        "description": "{4}: Put a +1/+1 counter on ~.",
+        "target_prompt": null,
+        "condition": null,
+        "optional_targeting": false,
+        "optional": false,
+        "forward_result": false
+      },
+      {
+        "kind": "Activated",
+        "effect": {
+          "type": "DealDamage",
+          "amount": {
+            "type": "Fixed",
+            "value": 1
+          },
+          "target": {
+            "type": "Any"
+          }
+        },
+        "cost": {
+          "type": "RemoveCounter",
+          "count": 1,
+          "counter_type": {
+            "type": "OfType",
+            "data": "P1P1"
+          },
+          "target": null,
+          "selection": "SingleObject"
+        },
+        "sub_ability": null,
+        "duration": null,
+        "description": "Remove a +1/+1 counter from ~: It deals 1 damage to any target.",
+        "target_prompt": null,
+        "condition": null,
+        "optional_targeting": false,
+        "optional": false,
+        "forward_result": false
+      }
+    ],
+    "triggers": [],
+    "static_abilities": [],
+    "replacements": [
+      {
+        "event": "Moved",
+        "execute": {
+          "kind": "Spell",
+          "effect": {
+            "type": "PutCounter",
+            "counter_type": "P1P1",
+            "count": {
+              "type": "Ref",
+              "qty": {
+                "type": "CostXPaid"
+              }
+            },
+            "target": {
+              "type": "SelfRef"
+            }
+          },
+          "cost": null,
+          "sub_ability": null,
+          "duration": null,
+          "description": null,
+          "target_prompt": null,
+          "condition": null,
+          "optional_targeting": false,
+          "optional": false,
+          "forward_result": false
+        },
+        "mode": {
+          "type": "Mandatory"
+        },
+        "valid_card": {
+          "type": "SelfRef"
+        },
+        "description": "~ enters with X +1/+1 counters on it.",
+        "condition": null,
+        "destination_zone": "Battlefield"
+      }
+    ],
+    "color_override": null
+  },
+  "thassa's oracle": {
+    "name": "Thassa's Oracle",
+    "mana_cost": {
+      "type": "Cost",
+      "shards": [
+        "Blue",
+        "Blue"
+      ],
+      "generic": 0
+    },
+    "card_type": {
+      "supertypes": [],
+      "core_types": [
+        "Creature"
+      ],
+      "subtypes": [
+        "Merfolk",
+        "Wizard"
+      ]
+    },
+    "power": {
+      "type": "Fixed",
+      "value": 1
+    },
+    "toughness": {
+      "type": "Fixed",
+      "value": 3
+    },
+    "loyalty": null,
+    "defense": null,
+    "non_ability_text": null,
+    "flavor_name": null,
+    "keywords": [],
+    "abilities": [],
+    "triggers": [
+      {
+        "mode": "ChangesZone",
+        "execute": {
+          "kind": "Spell",
+          "effect": {
+            "type": "Dig",
+            "player": {
+              "type": "Controller"
+            },
+            "count": {
+              "type": "Ref",
+              "qty": {
+                "type": "Devotion",
+                "colors": {
+                  "type": "Fixed",
+                  "value": [
+                    "Blue"
+                  ]
+                }
+              }
+            },
+            "destination": "Library",
+            "keep_count": 1,
+            "up_to": true,
+            "filter": {
+              "type": "Any"
+            },
+            "rest_destination": "Library",
+            "rest_order": "random",
+            "reveal": false,
+            "enter_tapped": false,
+            "enters_attacking": false
+          },
+          "cost": null,
+          "sub_ability": {
+            "kind": "Spell",
+            "effect": {
+              "type": "WinTheGame",
+              "target": {
+                "type": "Controller"
+              }
+            },
+            "cost": null,
+            "sub_ability": null,
+            "duration": null,
+            "description": null,
+            "target_prompt": null,
+            "condition": {
+              "type": "QuantityCheck",
+              "lhs": {
+                "type": "Ref",
+                "qty": {
+                  "type": "Devotion",
+                  "colors": {
+                    "type": "Fixed",
+                    "value": [
+                      "Blue"
+                    ]
+                  }
+                }
+              },
+              "comparator": "GE",
+              "rhs": {
+                "type": "Ref",
+                "qty": {
+                  "type": "ZoneCardCount",
+                  "zone": "Library",
+                  "card_types": [],
+                  "scope": "Controller"
+                }
+              }
+            },
+            "optional_targeting": false,
+            "optional": false,
+            "forward_result": false,
+            "sub_link": "SequentialSibling"
+          },
+          "duration": null,
+          "description": null,
+          "target_prompt": null,
+          "condition": null,
+          "optional_targeting": false,
+          "optional": false,
+          "forward_result": false
+        },
+        "valid_card": {
+          "type": "SelfRef"
+        },
+        "origin": null,
+        "destination": "Battlefield",
+        "trigger_zones": [
+          "Battlefield"
+        ],
+        "phase": null,
+        "optional": false,
+        "damage_kind": "Any",
+        "secondary": false,
+        "valid_target": null,
+        "valid_source": null,
+        "description": "When ~ enters, look at the top X cards of your library, where X is your devotion to blue. Put up to one of them on top of your library and the rest on the bottom of your library in a random order. If X is greater than or equal to the number of cards in your library, you win the game.",
+        "constraint": null,
+        "condition": null,
+        "batched": false
+      }
+    ],
+    "static_abilities": [],
+    "replacements": [],
+    "color_override": null,
+    "color_identity": [
+      "Blue"
+    ],
+    "bracket_signals": {
+      "game_changer": true,
+      "mass_land_denial": false,
+      "extra_turn": false,
+      "efficient_tutor": false
+    }
+  },
+  "demonic consultation": {
+    "name": "Demonic Consultation",
+    "mana_cost": {
+      "type": "Cost",
+      "shards": [
+        "Black"
+      ],
+      "generic": 0
+    },
+    "card_type": {
+      "supertypes": [],
+      "core_types": [
+        "Instant"
+      ],
+      "subtypes": []
+    },
+    "power": null,
+    "toughness": null,
+    "loyalty": null,
+    "defense": null,
+    "non_ability_text": null,
+    "flavor_name": null,
+    "keywords": [],
+    "abilities": [
+      {
+        "kind": "Spell",
+        "effect": {
+          "type": "Choose",
+          "choice_type": "CardName",
+          "persist": true
+        },
+        "cost": null,
+        "sub_ability": {
+          "kind": "Spell",
+          "effect": {
+            "type": "ExileTop",
+            "player": {
+              "type": "Controller"
+            },
+            "count": {
+              "type": "Fixed",
+              "value": 6
+            },
+            "position": {
+              "type": "Top"
+            }
+          },
+          "cost": null,
+          "sub_ability": {
+            "kind": "Spell",
+            "effect": {
+              "type": "RevealUntil",
+              "player": {
+                "type": "Controller"
+              },
+              "filter": {
+                "type": "HasChosenName"
+              },
+              "count": {
+                "type": "Fixed",
+                "value": 1
+              },
+              "kept_destination": "Hand",
+              "rest_destination": "Exile"
+            },
+            "cost": null,
+            "sub_ability": null,
+            "duration": null,
+            "description": null,
+            "target_prompt": null,
+            "condition": null,
+            "optional_targeting": false,
+            "optional": false,
+            "forward_result": false
+          },
+          "duration": null,
+          "description": null,
+          "target_prompt": null,
+          "condition": null,
+          "optional_targeting": false,
+          "optional": false,
+          "forward_result": false,
+          "sub_link": "SequentialSibling"
+        },
+        "duration": null,
+        "description": "Choose a card name. Exile the top six cards of your library, then reveal cards from the top of your library until you reveal a card with the chosen name. Put that card into your hand and exile all other cards revealed this way.",
+        "target_prompt": null,
+        "condition": null,
+        "optional_targeting": false,
+        "optional": false,
+        "forward_result": false
+      }
+    ],
+    "triggers": [],
+    "static_abilities": [],
+    "replacements": [],
+    "color_override": null,
+    "color_identity": [
+      "Black"
+    ],
+    "bracket_signals": {
+      "game_changer": false,
+      "mass_land_denial": false,
+      "extra_turn": false,
+      "efficient_tutor": true
+    }
+  },
+  "kiki-jiki, mirror breaker": {
+    "name": "Kiki-Jiki, Mirror Breaker",
+    "mana_cost": {
+      "type": "Cost",
+      "shards": [
+        "Red",
+        "Red",
+        "Red"
+      ],
+      "generic": 2
+    },
+    "card_type": {
+      "supertypes": [
+        "Legendary"
+      ],
+      "core_types": [
+        "Creature"
+      ],
+      "subtypes": [
+        "Goblin",
+        "Shaman"
+      ]
+    },
+    "power": {
+      "type": "Fixed",
+      "value": 2
+    },
+    "toughness": {
+      "type": "Fixed",
+      "value": 2
+    },
+    "loyalty": null,
+    "defense": null,
+    "non_ability_text": null,
+    "flavor_name": null,
+    "keywords": [
+      "Haste"
+    ],
+    "abilities": [
+      {
+        "kind": "Activated",
+        "effect": {
+          "type": "CopyTokenOf",
+          "target": {
+            "type": "Typed",
+            "type_filters": [
+              "Creature"
+            ],
+            "controller": "You",
+            "properties": [
+              {
+                "type": "NotSupertype",
+                "value": "Legendary"
+              }
+            ]
+          },
+          "owner": {
+            "type": "Controller"
+          },
+          "enters_attacking": false,
+          "tapped": false,
+          "count": {
+            "type": "Fixed",
+            "value": 1
+          },
+          "extra_keywords": [
+            "Haste"
+          ]
+        },
+        "cost": {
+          "type": "Tap"
+        },
+        "sub_ability": {
+          "kind": "Spell",
+          "effect": {
+            "type": "CreateDelayedTrigger",
+            "condition": {
+              "type": "AtNextPhase",
+              "phase": "End"
+            },
+            "effect": {
+              "kind": "Activated",
+              "effect": {
+                "type": "Sacrifice",
+                "target": {
+                  "type": "LastCreated"
+                },
+                "count": {
+                  "type": "Fixed",
+                  "value": 1
+                }
+              },
+              "cost": null,
+              "sub_ability": null,
+              "duration": null,
+              "description": null,
+              "target_prompt": null,
+              "condition": null,
+              "optional_targeting": false,
+              "optional": false,
+              "forward_result": false
+            },
+            "uses_tracked_set": false
+          },
+          "cost": null,
+          "sub_ability": null,
+          "duration": null,
+          "description": null,
+          "target_prompt": null,
+          "condition": null,
+          "optional_targeting": false,
+          "optional": false,
+          "forward_result": false,
+          "sub_link": "SequentialSibling"
+        },
+        "duration": null,
+        "description": "{T}: Create a token that's a copy of target nonlegendary creature you control, except it has haste. Sacrifice it at the beginning of the next end step.",
+        "target_prompt": null,
+        "condition": null,
+        "optional_targeting": false,
+        "optional": false,
+        "forward_result": false
+      }
+    ],
+    "triggers": [],
+    "static_abilities": [],
+    "replacements": [],
+    "color_override": null,
+    "color_identity": [
+      "Red"
+    ],
+    "brawl_commander": true,
+    "is_commander": true
+  },
+  "felidar guardian": {
+    "name": "Felidar Guardian",
+    "mana_cost": {
+      "type": "Cost",
+      "shards": [
+        "White"
+      ],
+      "generic": 3
+    },
+    "card_type": {
+      "supertypes": [],
+      "core_types": [
+        "Creature"
+      ],
+      "subtypes": [
+        "Cat",
+        "Beast"
+      ]
+    },
+    "power": {
+      "type": "Fixed",
+      "value": 1
+    },
+    "toughness": {
+      "type": "Fixed",
+      "value": 4
+    },
+    "loyalty": null,
+    "defense": null,
+    "non_ability_text": null,
+    "flavor_name": null,
+    "keywords": [],
+    "abilities": [],
+    "triggers": [
+      {
+        "mode": "ChangesZone",
+        "execute": {
+          "kind": "Spell",
+          "effect": {
+            "type": "ChangeZone",
+            "origin": null,
+            "destination": "Exile",
+            "target": {
+              "type": "Typed",
+              "type_filters": [
+                "Permanent"
+              ],
+              "controller": "You",
+              "properties": [
+                {
+                  "type": "Another"
+                }
+              ]
+            },
+            "owner_library": false,
+            "enter_transformed": false,
+            "enter_tapped": false,
+            "enters_attacking": false
+          },
+          "cost": null,
+          "sub_ability": {
+            "kind": "Spell",
+            "effect": {
+              "type": "ChangeZone",
+              "origin": null,
+              "destination": "Battlefield",
+              "target": {
+                "type": "ParentTarget"
+              },
+              "owner_library": false,
+              "enter_transformed": false,
+              "enter_tapped": false,
+              "enters_attacking": false
+            },
+            "cost": null,
+            "sub_ability": null,
+            "duration": null,
+            "description": null,
+            "target_prompt": null,
+            "condition": null,
+            "optional_targeting": false,
+            "optional": false,
+            "forward_result": false
+          },
+          "duration": null,
+          "description": null,
+          "target_prompt": null,
+          "condition": null,
+          "optional_targeting": false,
+          "optional": true,
+          "forward_result": false
+        },
+        "valid_card": {
+          "type": "SelfRef"
+        },
+        "origin": null,
+        "destination": "Battlefield",
+        "trigger_zones": [
+          "Battlefield"
+        ],
+        "phase": null,
+        "optional": true,
+        "damage_kind": "Any",
+        "secondary": false,
+        "valid_target": null,
+        "valid_source": null,
+        "description": "When ~ enters, you may exile another target permanent you control, then return that card to the battlefield under its owner's control.",
+        "constraint": null,
+        "condition": null,
+        "batched": false
+      }
+    ],
+    "static_abilities": [],
+    "replacements": [],
+    "color_override": null,
+    "color_identity": [
+      "White"
+    ]
+  }
+}

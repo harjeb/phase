@@ -1,33 +1,9 @@
-//! Hand-authored combo-line registry. The first real line is Heliod,
-//! Sun-Crowned + Walking Ballista — both cards parse cleanly today and form
-//! a self-contained two-card lethal-damage loop. Additional cEDH lines
-//! (Thoracle/Consult, Isochron/Reversal, Underworld Breach, Food Chain,
-//! Dockside Extortionist storm lines, ...) land in follow-up phases.
+//! Hand-authored structural templates for damage/counter, library-win,
+//! and copy/blink combos. Printed names are explanatory labels only.
 //!
-//! ## Heliod + Walking Ballista (CR 727 unbounded loop closing on lethal)
-//!
-//! Setup: AI controls Heliod, Sun-Crowned and Walking Ballista with at least
-//! one +1/+1 counter on it. AI has access to `{1}{W}` once.
-//!
-//! Loop:
-//!   1. Activate Heliod {1}{W} → target Walking Ballista. Ballista has
-//!      lifelink until end of turn.
-//!   2. Activate Walking Ballista's `Remove a +1/+1 counter: deal 1 damage`
-//!      ability targeting an opponent.
-//!   3. Lifelink trigger gains the AI 1 life (CR 702.15).
-//!   4. Heliod's life-gain trigger puts a +1/+1 counter on Ballista
-//!      (CR 603 triggered ability).
-//!   5. Counter cap is restored. Go to step 2 until each opponent is at 0
-//!      (CR 104.3b).
-//!
-//! Parser coverage verified via
-//! `jq '."heliod, sun-crowned"' client/public/card-data.json` and
-//! `jq '."walking ballista"' client/public/card-data.json`. Heliod's
-//! activated ability sits at `abilities[0]` (the only activated ability —
-//! the indestructible keyword and the devotion-based "isn't a creature"
-//! static live elsewhere). Walking Ballista's damage ability sits at
-//! `abilities[1]` (`abilities[0]` is the unrelated `{4}: put a +1/+1`
-//! growth ability).
+//! Role matching provides inexpensive component and tutor hints. The bounded
+//! engine planner, not the coarse reachability detector, validates costs,
+//! targets, choices, stack resolution, and resource restoration.
 
 use engine::types::game_state::GameState;
 use engine::types::mana::{ManaCost, ManaCostShard};
@@ -35,7 +11,8 @@ use engine::types::player::PlayerId;
 
 use crate::combo::detection::{piece_present, ComboDetector, StructuralComboDetector};
 use crate::combo::line::{
-    CardPredicate, ComboLine, ComboLineId, ComboPiece, ComboReachability, ComboStep, WinKind,
+    CardPredicate, ComboLine, ComboLineId, ComboPiece, ComboReachability, ComboStep, ComponentRole,
+    WinKind,
 };
 use engine::types::identifiers::ObjectId;
 
@@ -85,12 +62,12 @@ impl ComboRegistry {
     /// Used by the tutor target scorer: cards in this set should receive a
     /// dominant boost so the AI fetches the exact piece that closes a combo,
     /// rather than picking the highest-EV generic creature.
-    pub fn missing_pieces_for_near_reachable_lines(
+    pub fn missing_pieces_for_near_reachable_lines<'a>(
         &self,
-        state: &GameState,
+        state: &'a GameState,
         ai: PlayerId,
-    ) -> Vec<&'static str> {
-        let mut out: Vec<&'static str> = Vec::new();
+    ) -> Vec<&'a str> {
+        let mut out: Vec<&'a str> = Vec::new();
         for line in &self.lines {
             let (present, missing): (Vec<_>, Vec<_>) = line
                 .pieces
@@ -108,13 +85,35 @@ impl ComboRegistry {
             // OnBattlefield) also count: e.g., a tutor that grabs into hand
             // closes the gap for an InHand piece too.
             let _ = present;
-            if let Some(name) = match &missing[0] {
-                ComboPiece::InHand(CardPredicate::NameEquals(n))
-                | ComboPiece::OnBattlefield(CardPredicate::NameEquals(n))
-                | ComboPiece::InGraveyard(CardPredicate::NameEquals(n))
-                | ComboPiece::InLibrary(CardPredicate::NameEquals(n)) => Some(*n),
-            } {
+            let predicate = match missing[0] {
+                ComboPiece::InHand(predicate)
+                | ComboPiece::OnBattlefield(predicate)
+                | ComboPiece::InGraveyard(predicate)
+                | ComboPiece::InLibrary(predicate) => predicate,
+            };
+            let object_names = state
+                .objects
+                .values()
+                .filter(|object| {
+                    object.owner == ai
+                        && object.zone == engine::types::zones::Zone::Library
+                        && super::components::matches_object(predicate, object)
+                })
+                .map(|object| object.name.as_str());
+            let deck_names = state
+                .deck_pools
+                .iter()
+                .filter(|pool| pool.player == ai)
+                .flat_map(|pool| pool.current_main.iter())
+                .filter(|entry| super::components::matches_face(predicate, &entry.card))
+                .map(|entry| entry.card.name.as_str());
+            for name in object_names.chain(deck_names) {
                 if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+            if let CardPredicate::NameEquals(name) = predicate {
+                if !out.contains(name) {
                     out.push(name);
                 }
             }
@@ -152,9 +151,10 @@ impl ComboRegistry {
                 !in_hand_predicates.is_empty()
                     && in_hand_predicates.iter().all(|pred| {
                         hand.iter().any(|&id| {
-                            state.objects.get(&id).is_some_and(|obj| match pred {
-                                CardPredicate::NameEquals(name) => obj.name == *name,
-                            })
+                            state
+                                .objects
+                                .get(&id)
+                                .is_some_and(|obj| super::components::matches_object(pred, obj))
                         })
                     })
             })
@@ -163,17 +163,15 @@ impl ComboRegistry {
     }
 }
 
-/// Heliod, Sun-Crowned + Walking Ballista. See module docs for the loop
-/// rationale and CR references. Card name strings must match the canonical
-/// printed names attached to game objects (set from MTGJSON `face_name`/
-/// `name` at card load) — verified via card-data lookup keys above.
+/// Lifelink plus a life-gain counter trigger replenishes a counter-damage source.
+/// A surviving source needs at least two counters unless another effect protects it.
 fn heliod_ballista_line() -> ComboLine {
     ComboLine {
         id: ComboLineId(0),
         name: "Heliod, Sun-Crowned + Walking Ballista",
         pieces: vec![
-            ComboPiece::OnBattlefield(CardPredicate::NameEquals("Heliod, Sun-Crowned")),
-            ComboPiece::OnBattlefield(CardPredicate::NameEquals("Walking Ballista")),
+            ComboPiece::OnBattlefield(lifelink_counter_source()),
+            ComboPiece::OnBattlefield(CardPredicate::Role(ComponentRole::CounterDamage)),
         ],
         // Cost to start the loop: activate Heliod's {1}{W} once. Ballista's
         // damage ability pays via counter removal, not mana, so the per-loop
@@ -183,52 +181,30 @@ fn heliod_ballista_line() -> ComboLine {
             generic: 1,
         },
         action_sequence: vec![
-            ComboStep::Activate {
-                predicate: CardPredicate::NameEquals("Heliod, Sun-Crowned"),
-                ability_index: 0,
+            ComboStep::ActivateRole {
+                predicate: lifelink_counter_source(),
+                role: ComponentRole::LifelinkGrant,
             },
-            ComboStep::Activate {
-                predicate: CardPredicate::NameEquals("Walking Ballista"),
-                ability_index: 1,
+            ComboStep::ActivateRole {
+                predicate: CardPredicate::Role(ComponentRole::CounterDamage),
+                role: ComponentRole::CounterDamage,
             },
         ],
         win_kind: WinKind::InfiniteLoop,
     }
 }
 
-/// Thassa's Oracle + Demonic Consultation (CR 104.2a explicit "wins the
-/// game" via Thoracle's ETB-conditional `WinTheGame` effect).
-///
-/// Setup: AI has both cards in hand and `{1}{U}{U}{B}` available.
-///
-/// Play sequence (the engine handles stack ordering; the policy only needs
-/// to recognize the two casts):
-///   1. Cast Thassa's Oracle. Spell goes on the stack but hasn't resolved
-///      yet, so its ETB trigger has not fired.
-///   2. In response, cast Demonic Consultation naming a card the library
-///      doesn't contain. CR 701.17 / oracle-parsed effects: `ExileTop` 6
-///      then `RevealUntil(HasChosenName)` with `kept_destination: Hand` and
-///      `rest_destination: Exile`. With no matching card, the entire
-///      library is exiled to zero.
-///   3. Consultation resolves first (top of stack) — library is now empty.
-///   4. Thoracle resolves: ETB trigger fires (CR 603), `Dig X` with
-///      `X = devotion to blue`, then the conditional `WinTheGame` arm fires
-///      because `devotion >= ZoneCardCount(library) = 0`.
-///
-/// Parser coverage verified via
-/// `jq '."thassa'\''s oracle"' client/public/card-data.json` and
-/// `jq '."demonic consultation"' client/public/card-data.json`. The
-/// win-by-ETB chain (`Dig` → `PutAtLibraryPosition` → conditional
-/// `WinTheGame`) is fully typed in the parsed JSON.
+/// Library-win and named-card exile effects, requiring exactly `{U}{U}{B}`.
+/// The planner validates casts, naming, targets, and terminal engine resolution.
 fn thoracle_consultation_line() -> ComboLine {
     ComboLine {
         id: ComboLineId(1),
         name: "Thassa's Oracle + Demonic Consultation",
         pieces: vec![
-            ComboPiece::InHand(CardPredicate::NameEquals("Thassa's Oracle")),
-            ComboPiece::InHand(CardPredicate::NameEquals("Demonic Consultation")),
+            ComboPiece::InHand(CardPredicate::Role(ComponentRole::LibraryWin)),
+            ComboPiece::InHand(CardPredicate::Role(ComponentRole::LibraryExile)),
         ],
-        // {1}{U}{U}{B} — both spells must be castable in the same turn so
+        // {U}{U}{B} — both spells must be castable in the same turn so
         // Consultation can resolve before Thoracle's ETB.
         mana_cost: ManaCost::Cost {
             shards: vec![
@@ -236,62 +212,48 @@ fn thoracle_consultation_line() -> ComboLine {
                 ManaCostShard::Blue,
                 ManaCostShard::Black,
             ],
-            generic: 1,
+            generic: 0,
         },
         action_sequence: vec![
             ComboStep::Cast {
-                predicate: CardPredicate::NameEquals("Thassa's Oracle"),
+                predicate: CardPredicate::Role(ComponentRole::LibraryWin),
             },
             ComboStep::Cast {
-                predicate: CardPredicate::NameEquals("Demonic Consultation"),
+                predicate: CardPredicate::Role(ComponentRole::LibraryExile),
             },
         ],
         win_kind: WinKind::ImmediateLoss,
     }
 }
 
-/// Kiki-Jiki, Mirror Breaker + Felidar Guardian (CR 727 unbounded creature
-/// generation closing on lethal combat damage).
-///
-/// Setup: AI controls both. Kiki must have summoning sickness cleared (the
-/// engine's legal-actions layer handles that; the combo line records only
-/// the structural pieces).
-///
-/// Loop:
-///   1. Activate Kiki-Jiki `{T}: Create a token that's a copy of another
-///      target nonlegendary creature you control, except it has haste...`
-///      Target Felidar Guardian. A hasty Felidar token enters.
-///   2. The token Felidar's ETB trigger fires (CR 603, parsed as
-///      `ChangeZone` to Exile → `ChangeZone` to Battlefield): exile Kiki and
-///      return it. Kiki re-enters fresh, untapped.
-///   3. Repeat. Each cycle adds another hasty Felidar token to the
-///      battlefield, eventually swinging for lethal combat damage
-///      (CR 510.1 + CR 104.3b).
-///
-/// Parser coverage verified via `jq` lookups: Kiki's `CopyTokenOf` ability
-/// sits at `abilities[0]` (the Haste keyword lives in `.keywords`, not in
-/// the activated-ability array). Felidar's ETB is in `.triggers`, not
-/// `.abilities`, so it fires automatically — the combo action sequence has
-/// a single explicit player action.
+/// A haste-granting creature copy source and an entry-blink trigger.
+/// One completed cycle must create a token and restore the actual copy source.
 fn kiki_felidar_line() -> ComboLine {
     ComboLine {
         id: ComboLineId(2),
         name: "Kiki-Jiki, Mirror Breaker + Felidar Guardian",
         pieces: vec![
-            ComboPiece::OnBattlefield(CardPredicate::NameEquals("Kiki-Jiki, Mirror Breaker")),
-            ComboPiece::OnBattlefield(CardPredicate::NameEquals("Felidar Guardian")),
+            ComboPiece::OnBattlefield(CardPredicate::Role(ComponentRole::CreatureCopy)),
+            ComboPiece::OnBattlefield(CardPredicate::Role(ComponentRole::EntryBlink)),
         ],
         // The activation cost is `{T}` only — Kiki's mana cost is irrelevant
         // because it is already on the battlefield. No mana shortfall is
         // possible for the loop itself; the engine's legal-actions layer
         // enforces summoning-sickness / tapped-state constraints.
         mana_cost: ManaCost::NoCost,
-        action_sequence: vec![ComboStep::Activate {
-            predicate: CardPredicate::NameEquals("Kiki-Jiki, Mirror Breaker"),
-            ability_index: 0,
+        action_sequence: vec![ComboStep::ActivateRole {
+            predicate: CardPredicate::Role(ComponentRole::CreatureCopy),
+            role: ComponentRole::CreatureCopy,
         }],
         win_kind: WinKind::InfiniteLoop,
     }
+}
+
+fn lifelink_counter_source() -> CardPredicate {
+    CardPredicate::All(vec![
+        CardPredicate::Role(ComponentRole::LifelinkGrant),
+        CardPredicate::Role(ComponentRole::LifeCounter),
+    ])
 }
 
 #[cfg(test)]
@@ -334,8 +296,8 @@ mod tests {
         use engine::types::zones::Zone;
 
         let mut state = GameState::new_two_player(0);
-        // Four lands producing UUU+B → pays {1}{U}{U}{B} (two U pips + B pip +
-        // the third U covers the generic {1}).
+        // Four lands producing UUU+B → pays {U}{U}{B} (two U pips + B pip +
+        // one additional Island remains unused).
         let subtypes = ["Island", "Island", "Island", "Swamp"];
         for (i, subtype) in subtypes.iter().enumerate() {
             let land_id = create_object(
@@ -349,18 +311,14 @@ mod tests {
             obj.card_types.core_types.push(CoreType::Land);
             obj.card_types.subtypes.push(subtype.to_string());
         }
-        create_object(
+        crate::combo::tests::place(
             &mut state,
-            CardId(200),
-            PlayerId(0),
-            "Thassa's Oracle".to_string(),
+            &crate::combo::tests::card("thassa's oracle"),
             Zone::Hand,
         );
-        create_object(
+        crate::combo::tests::place(
             &mut state,
-            CardId(201),
-            PlayerId(0),
-            "Demonic Consultation".to_string(),
+            &crate::combo::tests::card("demonic consultation"),
             Zone::Hand,
         );
 
@@ -384,7 +342,7 @@ mod tests {
 
     /// Discriminating regression: both Thoracle pieces are in hand and the AI
     /// controls four untapped lands — but they produce only W and G, never the
-    /// U/U/B that {1}{U}{U}{B} requires. With the color-accurate affordability
+    /// U/U/B that {U}{U}{B} requires. With the color-accurate affordability
     /// primitive the line collapses to NotReachable and is filtered out.
     ///
     /// This MUST fail on pre-fix code: the old count-based check saw 4 mana
@@ -412,18 +370,14 @@ mod tests {
             obj.card_types.core_types.push(CoreType::Land);
             obj.card_types.subtypes.push(subtype.to_string());
         }
-        create_object(
+        crate::combo::tests::place(
             &mut state,
-            CardId(200),
-            PlayerId(0),
-            "Thassa's Oracle".to_string(),
+            &crate::combo::tests::card("thassa's oracle"),
             Zone::Hand,
         );
-        create_object(
+        crate::combo::tests::place(
             &mut state,
-            CardId(201),
-            PlayerId(0),
-            "Demonic Consultation".to_string(),
+            &crate::combo::tests::card("demonic consultation"),
             Zone::Hand,
         );
 

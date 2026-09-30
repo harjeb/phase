@@ -1,19 +1,24 @@
-//! Combo-recognition layer for cEDH difficulty.
+//! Structural combo recognition and bounded action-chain planning.
 //!
-//! - `line.rs` — pure types (`ComboLine`, `ComboPiece`, `ComboReachability`, ...)
-//! - `detection.rs` — `ComboDetector` trait + structural impl over `GameState`
-//! - `registry.rs` — hand-authored `ComboRegistry`
-//!
-//! `ComboLinePolicy` (in `policies/combo_line.rs`) wires this layer into the
-//! existing planner via `TacticalPolicy::activation()` keyed on
-//! `DeckFeatures::is_cedh`.
+//! Default templates recognize effect roles in live card definitions. The
+//! root planner validates complete traces through engine-issued candidates
+//! and simulation; policies reward only the next action of a current plan.
+//! Opponents pass in this simulation. A completed cycle is a one-cycle
+//! witness, not a guarantee of an unbounded or interaction-proof win.
 
+pub mod components;
 pub mod detection;
 pub mod line;
+pub mod planning;
 pub mod registry;
 
 pub use detection::{ComboDetector, StructuralComboDetector};
 pub use line::{
-    CardPredicate, ComboLine, ComboLineId, ComboPiece, ComboReachability, ComboStep, WinKind,
+    CardPredicate, ComboLine, ComboLineId, ComboPiece, ComboReachability, ComboStep, ComponentRole,
+    WinKind,
 };
+pub use planning::{plan_combos, ComboPlan, ComboPlanOutcome, ComboPlanningResult, PlannedAction};
 pub use registry::ComboRegistry;
+
+#[cfg(test)]
+pub(crate) mod tests;

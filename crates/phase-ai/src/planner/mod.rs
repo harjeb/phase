@@ -19,8 +19,7 @@ use crate::card_hints::should_play_now_with_facts;
 use crate::cast_facts::cast_facts_for_action;
 use crate::config::{AiConfig, OpponentModel};
 use crate::eval::{
-    evaluate_creature, evaluate_for_planner, evaluate_state, strategic_intent, threat_level,
-    StrategicIntent,
+    evaluate_creature, evaluate_state_breakdown, strategic_intent, threat_level, StrategicIntent,
 };
 use crate::policies::context::{PolicyContext, PriorsEnv, SearchDepth};
 use crate::policies::PolicyRegistry;
@@ -243,6 +242,18 @@ impl SearchBudget {
     pub fn tick(&mut self) {
         self.nodes_evaluated += 1;
     }
+
+    pub(crate) fn remaining_nodes(&self) -> u32 {
+        self.max_nodes.saturating_sub(self.nodes_evaluated)
+    }
+
+    pub(crate) fn for_root_candidate(&self, remaining_roots: usize) -> Self {
+        let quota = self
+            .remaining_nodes()
+            .checked_div(u32::try_from(remaining_roots).unwrap_or(u32::MAX))
+            .unwrap_or(0);
+        Self::with_deadline(quota, self.deadline)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -408,6 +419,7 @@ pub fn quick_state_hash(state: &GameState) -> u64 {
 /// beam ranking + rollout priors -> the TT'd search value. A bare discriminant
 /// would alias e.g. Ward(2) with Ward(100).
 fn fold_object_keywords(keywords: &[Keyword], hasher: &mut DefaultHasher) {
+    keywords.len().hash(hasher);
     for kw in keywords {
         kw.kind().hash(hasher);
         // Serde-fold the payload only for keywords not provably parameterless.
@@ -425,13 +437,9 @@ fn fold_object_keywords(keywords: &[Keyword], hasher: &mut DefaultHasher) {
     }
 }
 
-/// Position hash for the transposition table. Field dependency is a strict
-/// **superset** of `quick_state_hash`, adding the axes a *bound-returning* TT
-/// cannot tolerate aliasing on that the search's own caches don't already
-/// protect (a wrong TT hit skips a whole subtree, unlike a wrong eval-cache hit
-/// which only perturbs one leaf). See the TT design notes for the per-axis
-/// disposition and the two-cache (uncapped candidate_cache / capped eval_cache)
-/// argument that makes the omitted axes safe.
+/// Shared material-position digest for search, candidate, and evaluation caches.
+/// Extends `quick_state_hash` with zone order, object characteristics, and
+/// opponent/stack state that can change legal candidates or leaf utility.
 pub fn search_position_hash(state: &GameState) -> u64 {
     let mut hasher = DefaultHasher::new();
     // Base: reuse the existing digest, then extend its field dependency.
@@ -445,9 +453,35 @@ pub fn search_position_hash(state: &GameState) -> u64 {
 
     // Full library ordering per player (top-of-library cast / draw-horizon lines).
     for player in &state.players {
+        player.poison_counters.hash(&mut hasher);
+        player.is_eliminated.hash(&mut hasher);
         for &id in &player.library {
             id.hash(&mut hasher);
         }
+    }
+    for &id in state.exile.iter().chain(state.command_zone.iter()).chain(
+        state
+            .players
+            .iter()
+            .flat_map(|player| player.hand.iter().chain(player.graveyard.iter())),
+    ) {
+        if let Some(obj) = state.objects.get(&id) {
+            obj.card_types.supertypes.hash(&mut hasher);
+            obj.card_types.core_types.hash(&mut hasher);
+            obj.card_types.subtypes.hash(&mut hasher);
+            obj.face_down.hash(&mut hasher);
+            hash_json_value(
+                &serde_json::to_value(&obj.mana_cost).expect("mana cost serializes"),
+                &mut hasher,
+            );
+            fold_object_keywords(&obj.keywords, &mut hasher);
+        }
+    }
+    if let Some(combat) = &state.combat {
+        hash_json_value(
+            &serde_json::to_value(combat).expect("combat serializes"),
+            &mut hasher,
+        );
     }
 
     // commander_damage: read by eval commander-threat in 3+ player games; the
@@ -476,16 +510,18 @@ pub fn search_position_hash(state: &GameState) -> u64 {
     for &obj_id in &state.battlefield {
         if let Some(obj) = state.objects.get(&obj_id) {
             obj.summoning_sick.hash(&mut hasher);
-            if !obj.keywords.is_empty() {
-                fold_object_keywords(&obj.keywords, &mut hasher);
-            }
+            obj.card_types.supertypes.hash(&mut hasher);
+            obj.card_types.core_types.hash(&mut hasher);
+            obj.card_types.subtypes.hash(&mut hasher);
+            obj.face_down.hash(&mut hasher);
+            fold_object_keywords(&obj.keywords, &mut hasher);
         }
     }
 
     hasher.finish()
 }
 
-/// Cache key for `AiDecisionContext` — combines `quick_state_hash` (board
+/// Cache key for `AiDecisionContext` — combines `search_position_hash` (board
 /// state) with the full `WaitingFor` payload that drives `candidate_actions`.
 ///
 /// `quick_state_hash` alone is NOT sufficient: `candidate_actions` dispatches
@@ -497,10 +533,7 @@ pub fn search_position_hash(state: &GameState) -> u64 {
 /// sorted so hash-equal waiting states do not depend on `HashMap` iteration
 /// order.
 pub fn candidate_cache_key(state: &GameState) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    quick_state_hash(state).hash(&mut hasher);
-    hash_waiting_for(&state.waiting_for, &mut hasher);
-    hasher.finish()
+    transposition_key(state)
 }
 
 /// TT key: stronger position hash + full `WaitingFor` payload, so a maximizing
@@ -563,15 +596,15 @@ const REMOVAL_EXPOSURE_RISK_FLOOR: f64 = 0.2;
 /// Per-rung iterative-deepening witness: did the depth-N rung complete, and how
 /// much of its node budget it consumed. AI-local search-*quality* record (not an
 /// engine perf counter — `perf_counters.rs` is out of scope). A saturated rung
-/// is one where `nodes_used >= max_nodes` (`SearchBudget::tick` increments
-/// unconditionally while `exhausted()` checks `>=`, so the counter can equal or
-/// overshoot the cap by one).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// uses its full node allowance. Root witnesses expose how that allowance was
+/// distributed without changing the engine's performance counters.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RungStat {
     pub depth: u32,
     pub completed: bool,
     pub nodes_used: u32,
     pub max_nodes: u32,
+    pub root_nodes_used: Vec<u32>,
 }
 
 fn hash_waiting_for(waiting_for: &WaitingFor, hasher: &mut impl Hasher) {
@@ -706,11 +739,14 @@ pub struct PlannerServices<'a> {
     /// Witness: times a killer was present in a beam and rotated forward. The
     /// direct efficacy signal for the within-beam-vs-rescue follow-up decision.
     pub killer_orderings: u32,
+    /// Witness: horizon nodes expanded to finish an announcement/payment chain.
+    pub announcement_extensions: u32,
     /// Witness: one entry per iterative-deepening rung, pushed by
     /// `run_iterative_deepening`. Evidence that ordering work converts to
     /// realized search depth (did the deep rung complete, with how much
     /// node headroom).
     pub rung_stats: Vec<RungStat>,
+    pub(crate) combo_nodes_used: u32,
 }
 
 impl<'a> PlannerServices<'a> {
@@ -790,7 +826,9 @@ impl<'a> PlannerServices<'a> {
             killers: Default::default(),
             beta_cutoffs: 0,
             killer_orderings: 0,
+            announcement_extensions: 0,
             rung_stats: Vec::new(),
+            combo_nodes_used: 0,
         }
     }
 
@@ -809,7 +847,7 @@ impl<'a> PlannerServices<'a> {
     }
 
     /// Build an `AiDecisionContext` for `state`, reusing a cached one when a
-    /// prior search node hit the same `quick_state_hash`. Siblings at the same
+    /// prior search node hit the same `candidate_cache_key`. Siblings at the same
     /// game position in a search tree share the result — `candidate_actions`
     /// is not cheap, and search revisits positions often (especially in
     /// beam + rollout configurations).
@@ -817,6 +855,12 @@ impl<'a> PlannerServices<'a> {
         &mut self,
         state: &GameState,
     ) -> std::sync::Arc<AiDecisionContext> {
+        // The board/prompt key does not describe the complete pending payment
+        // payload. Bypass it for unfinished announcements in both beam and
+        // rollout paths; certification cannot recover omitted stale candidates.
+        if state.pending_cast.is_some() || is_announcement_continuation(state) {
+            return std::sync::Arc::new(build_decision_context(state));
+        }
         // MUST use candidate_cache_key, NOT quick_state_hash: the latter omits
         // state.waiting_for, which is the dispatch key for candidate_actions.
         // Using the wrong hash collides states with identical boards but
@@ -944,17 +988,26 @@ impl<'a> PlannerServices<'a> {
     }
 
     pub fn evaluate_state(&self, state: &GameState) -> f64 {
-        self.evaluate_with_strategy(state)
+        match self.strategic_value(state) {
+            Ok(value) => self.reduce_utility(
+                state,
+                &ValueEstimate {
+                    value,
+                    intent: strategic_intent(state, self.ai_player),
+                },
+            ),
+            Err(terminal) => terminal,
+        }
     }
 
     /// Cached evaluation: returns a previously computed result if the state hash matches,
     /// avoiding redundant evaluation of identical positions reached via different action orders.
     pub fn evaluate_state_cached(&mut self, state: &GameState) -> f64 {
-        let hash = quick_state_hash(state);
+        let hash = transposition_key(state);
         if let Some(&cached) = self.eval_cache.get(&hash) {
             return cached;
         }
-        let value = self.evaluate_with_strategy(state);
+        let value = self.evaluate_state(state);
         if self.eval_cache.len() < 256 {
             self.eval_cache.insert(hash, value);
         }
@@ -1064,8 +1117,13 @@ impl<'a> PlannerServices<'a> {
     /// Tactical eval (evaluate_state) is context-free and uses adjusted weights.
     /// Strategic dimensions (synergy, zone quality, card advantage) use AiContext.
     fn evaluate_with_strategy(&self, state: &GameState) -> f64 {
+        self.strategic_value(state)
+            .unwrap_or_else(|terminal| terminal)
+    }
+
+    fn strategic_value(&self, state: &GameState) -> Result<f64, f64> {
         let weights = self.context.adjusted_weights.for_turn(state.turn_number);
-        let tactical = evaluate_state(state, self.ai_player, weights);
+        let tactical = evaluate_state_breakdown(state, self.ai_player, weights)?.total();
 
         let synergy = self
             .context
@@ -1082,7 +1140,7 @@ impl<'a> PlannerServices<'a> {
         let card_adv =
             crate::card_advantage::differential(state, self.ai_player) * weights.card_advantage;
 
-        tactical + synergy + zones + card_adv + self.threat_adjustment(state)
+        Ok(tactical + synergy + zones + card_adv + self.threat_adjustment(state))
     }
 
     /// Adjust evaluation based on opponent threat probabilities.
@@ -1159,8 +1217,10 @@ impl<'a> PlannerServices<'a> {
     }
 
     pub fn evaluate_for_planner(&self, state: &GameState) -> ValueEstimate {
-        let weights = self.context.adjusted_weights.for_turn(state.turn_number);
-        evaluate_for_planner(state, self.ai_player, weights)
+        ValueEstimate {
+            value: self.evaluate_with_strategy(state),
+            intent: strategic_intent(state, self.ai_player),
+        }
     }
 
     /// Quiescence search: resolve forced actions and mechanical choices until the
@@ -1271,13 +1331,7 @@ impl<'a> PlannerServices<'a> {
 
     /// Evaluate a leaf state for utility with quiescence.
     pub fn quiesced_leaf_eval(&mut self, state: &GameState) -> f64 {
-        if state.stack.is_empty() || self.deadline.expired() {
-            let value = self.evaluate_for_planner(state);
-            return self.reduce_utility(state, &value);
-        }
-        let quiesced = self.quiesce(state);
-        let value = self.evaluate_for_planner(&quiesced);
-        self.reduce_utility(&quiesced, &value)
+        self.evaluate_state_quiesced(state)
     }
 
     pub fn tactical_score(
@@ -1404,11 +1458,25 @@ impl<'a> PlannerServices<'a> {
     }
 
     pub fn rollout_estimate(&mut self, state: &GameState, depth: u32) -> f64 {
+        let mut budget = SearchBudget::with_deadline(self.config.search.max_nodes, self.deadline);
+        if budget.exhausted() {
+            return self.evaluate_state_cached(state);
+        }
+        budget.tick();
+        self.rollout_estimate_with_budget(state, depth, &mut budget)
+    }
+
+    fn rollout_estimate_with_budget(
+        &mut self,
+        state: &GameState,
+        depth: u32,
+        budget: &mut SearchBudget,
+    ) -> f64 {
         // CR-agnostic: if the wall-clock budget is blown, short-circuit to the
         // cheap leaf evaluator rather than descending further. Without this
         // bail, rollout recursion ignores `time_budget_ms` entirely.
-        if self.deadline.expired() {
-            return self.quiesced_leaf_eval(state);
+        if budget.exhausted() || self.deadline.expired() {
+            return self.evaluate_state_cached(state);
         }
         if depth == 0 || matches!(state.waiting_for, WaitingFor::GameOver { .. }) {
             return self.quiesced_leaf_eval(state);
@@ -1420,12 +1488,18 @@ impl<'a> PlannerServices<'a> {
         }
 
         let rollout_player = state.waiting_for.acting_player().unwrap_or(self.ai_player);
-        let sample_count = self.config.search.rollout_samples.max(1) as usize;
+        let sample_count = self
+            .config
+            .search
+            .rollout_samples
+            .max(1)
+            .min(budget.remaining_nodes()) as usize;
         let continuations =
             self.sample_backfilled_continuations(state, evaluation.priors, sample_count);
         if continuations.is_empty() {
             return self.quiesced_leaf_eval(state);
         }
+        budget.nodes_evaluated += continuations.len() as u32;
         // CR-agnostic: if the budget was blown while sampling continuations,
         // short-circuit to the cheap leaf eval instead of descending the rollout
         // tree. Closes the post-sampling path the reporter flagged; the top-of-
@@ -1436,7 +1510,9 @@ impl<'a> PlannerServices<'a> {
         let is_maximizing = rollout_player == self.ai_player;
         continuations
             .into_iter()
-            .map(|(prior, sim)| self.rollout_estimate(&sim, depth - 1) + (prior * 0.05))
+            .map(|(prior, sim)| {
+                self.rollout_estimate_with_budget(&sim, depth - 1, budget) + (prior * 0.05)
+            })
             .reduce(|best, value| {
                 if is_maximizing {
                     best.max(value)
@@ -1457,6 +1533,21 @@ pub trait ContinuationPlanner {
     ) -> f64;
 }
 
+/// Search-policy allowance, not a game-rule shortcut. Only unfinished cast
+/// announcements/payment may spend these extra edges at the normal horizon.
+const ANNOUNCEMENT_EXTENSION_STEPS: u8 = 2;
+
+fn is_announcement_continuation(state: &GameState) -> bool {
+    match classify_payment_continuation(state) {
+        PaymentContinuationState::Affiliated(_) => true,
+        PaymentContinuationState::UnsupportedAffiliated(_) => false,
+        PaymentContinuationState::NotAffiliated => matches!(
+            state.waiting_for,
+            WaitingFor::TargetSelection { .. } | WaitingFor::ChooseXValue { .. }
+        ),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct BeamContinuationPlanner {
     pub depth: u32,
@@ -1470,22 +1561,63 @@ impl BeamContinuationPlanner {
         state: &GameState,
         depth: u32,
         ply: usize,
+        alpha: f64,
+        beta: f64,
+        services: &mut PlannerServices<'_>,
+        budget: &mut SearchBudget,
+    ) -> f64 {
+        self.search_with_extension(
+            state,
+            depth,
+            ANNOUNCEMENT_EXTENSION_STEPS,
+            ply,
+            alpha,
+            beta,
+            services,
+            budget,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_with_extension(
+        &self,
+        state: &GameState,
+        depth: u32,
+        extension_left: u8,
+        ply: usize,
         mut alpha: f64,
         mut beta: f64,
         services: &mut PlannerServices<'_>,
         budget: &mut SearchBudget,
     ) -> f64 {
-        budget.tick();
-        if depth == 0 {
-            return services.rollout_estimate(state, self.rollout_depth);
+        // Never start a rollout/extension after the shared node or time budget
+        // has expired. Static evaluation schedules no reducer work.
+        if budget.exhausted() || services.deadline.expired() {
+            return services.evaluate_state(state);
         }
+        budget.tick();
         if budget.exhausted() || matches!(state.waiting_for, WaitingFor::GameOver { .. }) {
-            return services.evaluate_state_quiesced(state);
+            return services.evaluate_state(state);
+        }
+        let announcement = is_announcement_continuation(state);
+        let extending = depth == 0 && extension_left > 0 && announcement;
+        if depth == 0 && !extending {
+            return services.rollout_estimate_with_budget(state, self.rollout_depth, budget);
+        }
+        if extending {
+            services.announcement_extensions += 1;
         }
 
-        let key = transposition_key(state);
-        if let Some(v) = services.tt_probe(key, depth, alpha, beta) {
-            return v; // re-search skipped
+        // Every ordinary node has the same fixed leaf-extension allowance.
+        // Extended nodes never enter the TT: their remaining allowance differs.
+        // Pending announcements also bypass it because the ordinary position
+        // key does not include the complete pending-cast/payment payload.
+        let key = (depth > 0 && !announcement && state.pending_cast.is_none())
+            .then(|| transposition_key(state));
+        if let Some(key) = key {
+            if let Some(v) = services.tt_probe(key, depth, alpha, beta) {
+                return v;
+            }
         }
         // Capture the ORIGINAL window before the alpha-beta loop mutates it, so
         // `tt_store` classifies the bound against the window this node opened with
@@ -1501,6 +1633,9 @@ impl BeamContinuationPlanner {
         // same skip: illegal candidates are dropped when apply_candidate returns
         // None during backfill sampling, not by an upfront clone-per-candidate probe.
         let candidates = prepare_payment_candidates(state, ctx.candidates.clone());
+        if budget.exhausted() || services.deadline.expired() {
+            return services.evaluate_state(state);
+        }
         if candidates.is_empty() {
             return services.evaluate_state_quiesced(state);
         }
@@ -1521,12 +1656,13 @@ impl BeamContinuationPlanner {
                     SearchDepth::Lookahead,
                 )
             },
-            services.config.search.max_branching as usize,
+            usize::MAX,
         );
-        // Move ordering: try killer moves (prior beta-cutoff causers at this ply)
-        // first to maximize alpha-beta pruning. Reorder-only — candidate scores
-        // are never mutated (they leak into the value function below).
-        services.order_killers_first(ply, &mut ranked);
+        let width = services.config.search.max_branching as usize;
+        // Keep the ranked tail for legality backfill. Killers reorder only the
+        // original beam, never promote a low-scoring tail action into it.
+        let beam_len = width.min(ranked.len());
+        services.order_killers_first(ply, &mut ranked[..beam_len]);
 
         // Alpha-beta pruning: explicit loop for early cutoff.
         // Move ordering from rank_candidates (best-first) maximizes pruning effectiveness.
@@ -1536,11 +1672,11 @@ impl BeamContinuationPlanner {
             f64::INFINITY
         };
 
+        let mut applied = 0;
         for ranked in ranked {
-            // Bail mid-loop on wall-clock budget: the outer beam can be wide
-            // (branching × depth), so checking only at entry lets a single node
-            // burn the full deadline before bubbling back up.
-            if services.deadline.expired() {
+            // Width counts successful continuations, not rejected simulations.
+            // Both ordinary and extended nodes share the existing rung budget.
+            if applied == width || budget.exhausted() || services.deadline.expired() {
                 break;
             }
             let Some(sim) = ranked
@@ -1550,8 +1686,22 @@ impl BeamContinuationPlanner {
             else {
                 continue;
             };
-            let value = self.search_value(&sim, depth - 1, ply + 1, alpha, beta, services, budget)
-                + (ranked.score * 0.05);
+            applied += 1;
+            let bonus = ranked.score * 0.05;
+            let value = self.search_with_extension(
+                &sim,
+                depth.saturating_sub(1),
+                if extending {
+                    extension_left - 1
+                } else {
+                    extension_left
+                },
+                ply + 1,
+                alpha - bonus,
+                beta - bonus,
+                services,
+                budget,
+            ) + bonus;
 
             if is_maximizing {
                 best = best.max(value);
@@ -1571,7 +1721,11 @@ impl BeamContinuationPlanner {
         }
 
         let result = if best.is_infinite() {
-            services.evaluate_state_quiesced(state)
+            if budget.exhausted() || services.deadline.expired() {
+                services.evaluate_state(state)
+            } else {
+                services.evaluate_state_quiesced(state)
+            }
         } else {
             best
         };
@@ -1579,8 +1733,10 @@ impl BeamContinuationPlanner {
         // `budget.exhausted()` includes `deadline.expired()`, so a node that broke
         // early on the mid-loop deadline bail is NOT stored — only genuinely
         // completed nodes enter the TT.
-        if !budget.exhausted() {
-            services.tt_store(key, depth, result, alpha_orig, beta_orig);
+        if !budget.exhausted() && !services.deadline.expired() {
+            if let Some(key) = key {
+                services.tt_store(key, depth, result, alpha_orig, beta_orig);
+            }
         }
         result
     }
@@ -1648,6 +1804,9 @@ pub fn apply_candidate(state: &GameState, candidate: &CandidateAction) -> Option
 }
 
 #[cfg(test)]
+mod search_horizon_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use engine::ai_support::{ActionMetadata, TacticalClass};
@@ -1683,6 +1842,235 @@ mod tests {
             player: PlayerId(0),
         };
         state
+    }
+
+    #[test]
+    fn candidate_cache_regenerates_after_summoning_sickness_changes() {
+        let mut state = make_state();
+        let source = add_mana_land(&mut state, PlayerId(0));
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Creature];
+        let mut ability = AbilityDefinition::new(AbilityKind::Activated, Effect::NoOp);
+        ability.cost = Some(AbilityCost::Tap);
+        std::sync::Arc::make_mut(&mut state.objects.get_mut(&source).unwrap().abilities)
+            .push(ability);
+        let config = create_config(AiDifficulty::Medium, Platform::Native).into_measurement(7);
+        let mut services =
+            PlannerServices::new_default(PlayerId(0), &config, PolicyRegistry::shared());
+        let ready = services.build_decision_context(&state);
+        let mut sick = state.clone();
+        sick.objects.get_mut(&source).unwrap().summoning_sick = true;
+        assert_eq!(quick_state_hash(&state), quick_state_hash(&sick));
+        let regenerated = services.build_decision_context(&sick);
+        assert!(!std::sync::Arc::ptr_eq(&ready, &regenerated));
+        let fresh = build_decision_context(&sick);
+        let actions = |context: &AiDecisionContext| {
+            context
+                .candidates
+                .iter()
+                .map(|candidate| candidate.action.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(actions(&ready), actions(&fresh));
+        assert_eq!(actions(&regenerated), actions(&fresh));
+    }
+
+    #[test]
+    fn evaluation_cache_tracks_available_mana_changes() {
+        let mut state = make_state();
+        let source = add_mana_land(&mut state, PlayerId(0));
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Creature];
+        let card = create_object(
+            &mut state,
+            CardId(900),
+            PlayerId(0),
+            "Hand card".into(),
+            Zone::Hand,
+        );
+        state.objects.get_mut(&card).unwrap().mana_cost = engine::types::mana::ManaCost::generic(1);
+        let config = create_config(AiDifficulty::Medium, Platform::Native).into_measurement(7);
+        let mut services =
+            PlannerServices::new_default(PlayerId(0), &config, PolicyRegistry::shared());
+        let ready = services.evaluate_state_cached(&state);
+        let mut sick = state.clone();
+        sick.objects.get_mut(&source).unwrap().summoning_sick = true;
+        let fresh = services.evaluate_state(&sick);
+        assert_ne!(ready, fresh);
+        assert_eq!(services.evaluate_state_cached(&sick), fresh);
+    }
+
+    #[test]
+    fn evaluation_cache_tracks_graveyard_keywords() {
+        let mut state = make_state();
+        let card = create_object(
+            &mut state,
+            CardId(900),
+            PlayerId(0),
+            "Graveyard card".into(),
+            Zone::Graveyard,
+        );
+        let config = create_config(AiDifficulty::Medium, Platform::Native).into_measurement(7);
+        let mut services =
+            PlannerServices::new_default(PlayerId(0), &config, PolicyRegistry::shared());
+        let plain = services.evaluate_state_cached(&state);
+        state
+            .objects
+            .get_mut(&card)
+            .unwrap()
+            .keywords
+            .push(Keyword::Flashback(
+                engine::types::keywords::FlashbackCost::Mana(
+                    engine::types::mana::ManaCost::generic(1),
+                ),
+            ));
+        let fresh = services.evaluate_state(&state);
+        assert_ne!(plain, fresh);
+        assert_eq!(services.evaluate_state_cached(&state), fresh);
+    }
+
+    #[test]
+    fn evaluation_cache_tracks_terminal_outcomes() {
+        let mut state = make_state();
+        let config = create_config(AiDifficulty::Medium, Platform::Native).into_measurement(7);
+        let mut services =
+            PlannerServices::new_default(PlayerId(0), &config, PolicyRegistry::shared());
+        let playing = services.evaluate_state_cached(&state);
+        state.waiting_for = WaitingFor::GameOver {
+            winner: Some(PlayerId(0)),
+        };
+        let fresh = services.evaluate_state(&state);
+        assert_ne!(playing, fresh);
+        assert_eq!(services.evaluate_state_cached(&state), fresh);
+    }
+
+    #[test]
+    fn terminal_utility_does_not_include_strategic_bonuses() {
+        let mut state = make_state();
+        create_object(
+            &mut state,
+            CardId(900),
+            PlayerId(0),
+            "Hand card".into(),
+            Zone::Hand,
+        );
+        let config = create_config(AiDifficulty::Hard, Platform::Native).into_measurement(7);
+        let mut services =
+            PlannerServices::new_default(PlayerId(0), &config, PolicyRegistry::shared());
+        for winner in [Some(PlayerId(0)), Some(PlayerId(1)), None] {
+            state.waiting_for = WaitingFor::GameOver { winner };
+            let expected = crate::eval::evaluate_state(
+                &state,
+                PlayerId(0),
+                services
+                    .context
+                    .adjusted_weights
+                    .for_turn(state.turn_number),
+            );
+            assert_eq!(services.evaluate_for_planner(&state).value, expected);
+            assert_eq!(services.evaluate_state(&state), expected);
+            assert_eq!(services.evaluate_state_cached(&state), expected);
+            assert_eq!(services.quiesced_leaf_eval(&state), expected);
+        }
+    }
+
+    #[test]
+    fn rollout_leaf_preserves_strategic_evaluation() {
+        let mut state = make_state();
+        create_object(
+            &mut state,
+            CardId(900),
+            PlayerId(0),
+            "Hand card".into(),
+            Zone::Hand,
+        );
+        let config = create_config(AiDifficulty::Medium, Platform::Native).into_measurement(7);
+        let mut services =
+            PlannerServices::new_default(PlayerId(0), &config, PolicyRegistry::shared());
+        let weights = services
+            .context
+            .adjusted_weights
+            .for_turn(state.turn_number);
+        let strategic = services.evaluate_with_strategy(&state);
+        assert_ne!(
+            strategic,
+            crate::eval::evaluate_state(&state, PlayerId(0), weights)
+        );
+        assert_eq!(services.evaluate_for_planner(&state).value, strategic);
+        assert_eq!(
+            services.quiesced_leaf_eval(&state),
+            services.evaluate_state(&state)
+        );
+        assert_eq!(
+            services.rollout_estimate(&state, 0),
+            services.evaluate_state(&state)
+        );
+    }
+
+    #[test]
+    fn zero_node_budget_skips_rollout_generation() {
+        let state = make_state_with_land();
+        let mut config = create_config(AiDifficulty::Hard, Platform::Native).into_measurement(7);
+        config.search.max_nodes = 0;
+        let mut services =
+            PlannerServices::new_default(PlayerId(0), &config, PolicyRegistry::shared());
+        assert!(services.candidate_cache.is_empty());
+        assert_eq!(
+            services.rollout_estimate(&state, 3),
+            services.evaluate_state(&state)
+        );
+        assert!(services.candidate_cache.is_empty());
+    }
+
+    #[test]
+    fn rollout_expansions_consume_search_budget() {
+        let state = make_state_with_land();
+        let config = create_config(AiDifficulty::Hard, Platform::Native).into_measurement(7);
+        let nodes_used = |rollout_depth| {
+            let mut services =
+                PlannerServices::new_default(PlayerId(0), &config, PolicyRegistry::shared());
+            let planner = BeamContinuationPlanner {
+                depth: 1,
+                rollout_depth,
+            };
+            let mut budget = SearchBudget::new(100);
+            assert!(planner
+                .search_value(
+                    &state,
+                    1,
+                    0,
+                    f64::NEG_INFINITY,
+                    f64::INFINITY,
+                    &mut services,
+                    &mut budget
+                )
+                .is_finite());
+            budget.nodes_evaluated
+        };
+        let shallow = nodes_used(0);
+        assert!(shallow > 0);
+        assert!(nodes_used(2) > shallow);
+    }
+
+    #[test]
+    fn leaf_utility_is_independent_of_search_path() {
+        let state = make_state();
+        let config = create_config(AiDifficulty::Hard, Platform::Native).into_measurement(7);
+        let mut services =
+            PlannerServices::new_default(PlayerId(0), &config, PolicyRegistry::shared());
+        let value = services.evaluate_for_planner(&state);
+        let expected = services.reduce_utility(&state, &value);
+        assert_eq!(services.evaluate_state(&state), expected);
+        assert_eq!(services.evaluate_state_cached(&state), expected);
+        assert_eq!(services.quiesced_leaf_eval(&state), expected);
     }
 
     #[test]
@@ -2177,6 +2565,28 @@ mod tests {
             forward_actions, reversed_actions,
             "tied candidates must rank identically regardless of input encounter order"
         );
+    }
+
+    #[test]
+    fn root_quotas_reserve_and_reuse_node_headroom() {
+        let mut shared = SearchBudget::new(11);
+        let mut first = shared.for_root_candidate(3);
+        assert_eq!(first.max_nodes, 3);
+        first.tick();
+        first.tick();
+        shared.nodes_evaluated += first.nodes_evaluated;
+        let mut second = shared.for_root_candidate(2);
+        assert_eq!(second.max_nodes, 4);
+        for _ in 0..second.max_nodes {
+            second.tick();
+        }
+        shared.nodes_evaluated += second.nodes_evaluated;
+        let last = shared.for_root_candidate(1);
+        assert_eq!(last.max_nodes, 5);
+        assert_eq!(shared.for_root_candidate(0).max_nodes, 0);
+        assert_eq!(shared.nodes_evaluated + last.max_nodes, shared.max_nodes);
+        let expired = SearchBudget::with_deadline(9, engine::util::Deadline::after(0));
+        assert!(expired.for_root_candidate(3).exhausted());
     }
 
     #[test]

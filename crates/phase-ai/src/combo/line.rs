@@ -21,9 +21,7 @@ pub struct ComboLine {
 }
 
 /// A required component of a combo line, located by zone + predicate.
-/// Predicates are intentionally narrow for the skeleton — name-based matching
-/// is acceptable here because combo lines are hand-authored. Structural
-/// predicates can replace name matching once the AST coverage stabilises.
+/// Default templates compose effect-based roles rather than printed names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComboPiece {
     InHand(CardPredicate),
@@ -35,11 +33,23 @@ pub enum ComboPiece {
     InLibrary(CardPredicate),
 }
 
-/// Narrow card predicate for the combo skeleton. Real combo content can
-/// extend this to compose structural filters.
+/// Composable component predicate. Name matching remains available for custom lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CardPredicate {
     NameEquals(&'static str),
+    Role(ComponentRole),
+    All(Vec<CardPredicate>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ComponentRole {
+    LifelinkGrant,
+    LifeCounter,
+    CounterDamage,
+    LibraryWin,
+    LibraryExile,
+    CreatureCopy,
+    EntryBlink,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +60,10 @@ pub enum ComboStep {
     Activate {
         predicate: CardPredicate,
         ability_index: u8,
+    },
+    ActivateRole {
+        predicate: CardPredicate,
+        role: ComponentRole,
     },
 }
 

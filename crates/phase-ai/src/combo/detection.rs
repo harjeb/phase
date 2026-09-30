@@ -12,6 +12,7 @@ use engine::types::identifiers::ObjectId;
 use engine::types::mana::ManaCost;
 use engine::types::player::PlayerId;
 
+use super::components::{matches_ability, matches_object};
 use crate::combo::line::{CardPredicate, ComboLine, ComboPiece, ComboReachability, ComboStep};
 use engine::types::game_state::CastPaymentMode;
 
@@ -97,7 +98,7 @@ pub(crate) fn piece_present(piece: &ComboPiece, state: &GameState, ai: PlayerId)
             state
                 .objects
                 .get(&id)
-                .is_some_and(|obj| obj.controller == ai && matches_predicate(pred, &obj.name))
+                .is_some_and(|obj| obj.controller == ai && matches_object(pred, obj))
         }),
         ComboPiece::InGraveyard(pred) => player
             .graveyard
@@ -114,13 +115,7 @@ fn matches_in_zone(pred: &CardPredicate, state: &GameState, id: ObjectId) -> boo
     state
         .objects
         .get(&id)
-        .is_some_and(|obj| matches_predicate(pred, &obj.name))
-}
-
-fn matches_predicate(pred: &CardPredicate, name: &str) -> bool {
-    match pred {
-        CardPredicate::NameEquals(target) => name == *target,
-    }
+        .is_some_and(|obj| matches_object(pred, obj))
 }
 
 /// Resolves each `ComboStep` to a concrete `GameAction` by binding the
@@ -137,6 +132,19 @@ fn resolve_action_sequence(
     sequence
         .iter()
         .filter_map(|step| match step {
+            ComboStep::ActivateRole { predicate, role } => {
+                let source_id = find_battlefield_object(state, ai, predicate)?;
+                let ability_index = state
+                    .objects
+                    .get(&source_id)?
+                    .abilities
+                    .iter()
+                    .position(|ability| matches_ability(*role, ability))?;
+                Some(GameAction::ActivateAbility {
+                    source_id,
+                    ability_index,
+                })
+            }
             ComboStep::Activate {
                 predicate,
                 ability_index,
@@ -171,7 +179,7 @@ fn find_battlefield_object(
         state
             .objects
             .get(&id)
-            .is_some_and(|obj| obj.controller == ai && matches_predicate(pred, &obj.name))
+            .is_some_and(|obj| obj.controller == ai && matches_object(pred, obj))
     })
 }
 
@@ -191,7 +199,7 @@ fn find_hand_object(state: &GameState, ai: PlayerId, pred: &CardPredicate) -> Op
 /// cost on its battlefield source; a `Cast` step bears it on the hand object.
 fn cost_bearing_source(line: &ComboLine, state: &GameState, ai: PlayerId) -> Option<ObjectId> {
     match line.action_sequence.first() {
-        Some(ComboStep::Activate { predicate, .. }) => {
+        Some(ComboStep::Activate { predicate, .. } | ComboStep::ActivateRole { predicate, .. }) => {
             find_battlefield_object(state, ai, predicate)
         }
         Some(ComboStep::Cast { predicate }) => find_hand_object(state, ai, predicate),

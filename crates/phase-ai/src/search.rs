@@ -3244,6 +3244,26 @@ fn score_candidates_core(
     let mut services =
         PlannerServices::with_deadline(ai_player, config, policies, context, deadline_override);
 
+    let combo_analysis = if services
+        .context
+        .session
+        .features
+        .get(&ai_player)
+        .is_some_and(|features| {
+            features.bracket_tier == engine::game::bracket_estimate::CommanderBracketTier::Cedh
+        }) {
+        crate::combo::plan_combos(
+            state,
+            ai_player,
+            (config.search.max_nodes / 2).min(96),
+            services.deadline,
+        )
+    } else {
+        crate::combo::ComboPlanningResult::default()
+    };
+    services.combo_nodes_used = combo_analysis.nodes_used;
+    services.context.combo_plan = combo_analysis.plan.map(Arc::new);
+
     // Combat decisions bypass the candidate pipeline entirely — the combat AI
     // reads directly from game state and never uses generated candidates.
     // This must run before validation/gating, which can filter out all candidates
@@ -3298,6 +3318,19 @@ fn score_candidates_core(
 
     if actions.is_empty() {
         return vec![];
+    }
+
+    if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+        if let Some(step) = services
+            .context
+            .combo_plan
+            .as_ref()
+            .and_then(|plan| plan.next_action(state, ai_player))
+        {
+            if actions.contains(&step.action) {
+                return vec![(step.action.clone(), 1.0)];
+            }
+        }
     }
 
     // Deterministic early returns — these don't benefit from search/parallelism.
@@ -3424,6 +3457,10 @@ fn run_iterative_deepening(
         .map(|r| (r.candidate.action.clone(), r.root_score(tactical_weight)))
         .collect();
 
+    let remaining_nodes = config
+        .search
+        .max_nodes
+        .saturating_sub(services.combo_nodes_used);
     for iter_depth in 0..=ceiling {
         // Guard EVERY rung (incl. rung 0) at entry. Interactive: a pre-expired
         // deadline returns the tactical-only floor with zero applies (==
@@ -3432,19 +3469,22 @@ fn run_iterative_deepening(
         if services.deadline.expired() {
             break;
         }
+        if iter_depth > 0 && remaining_nodes < ranked.len() as u32 {
+            break;
+        }
         // Fresh node budget per rung sharing the one services.deadline (none()
         // in measurement, so this single constructor is correct for both modes).
-        // The deepest rung thus gets the full max_nodes just like origin/main's
-        // single pass.
-        let mut budget = SearchBudget::with_deadline(config.search.max_nodes, services.deadline);
+        // Every rung reserves the nodes already spent preparing the combo plan.
+        let mut budget = SearchBudget::with_deadline(remaining_nodes, services.deadline);
         let mut planner = BeamContinuationPlanner {
             depth: iter_depth,
             rollout_depth: config.search.rollout_depth,
         };
 
         let mut rung_scored = Vec::with_capacity(ranked.len());
+        let mut root_nodes_used = Vec::with_capacity(ranked.len());
         let mut completed = true;
-        for r in &ranked {
+        for (root_index, r) in ranked.iter().enumerate() {
             // Rungs >= 1 may bail mid-rung (interior search is expensive) and
             // discard the partial. Rung 0 is cheap (branching quiesced evals)
             // and runs atomically once entered, so it is never left partial.
@@ -3452,12 +3492,13 @@ fn run_iterative_deepening(
                 completed = false;
                 break;
             }
+            let mut candidate_budget = budget.for_root_candidate(ranked.len() - root_index);
             let score = if let Some(sim) = r
                 .payment_successor
                 .clone()
                 .or_else(|| apply_candidate(state, &r.candidate))
             {
-                let cont = planner.evaluate_after_action(&sim, services, &mut budget);
+                let cont = planner.evaluate_after_action(&sim, services, &mut candidate_budget);
                 let continuation = r
                     .continuation_witness
                     .filter(|witness| witness.is_finite())
@@ -3469,6 +3510,8 @@ fn run_iterative_deepening(
                 r.score - 1000.0
             };
             rung_scored.push((r.candidate.action.clone(), score));
+            root_nodes_used.push(candidate_budget.nodes_evaluated);
+            budget.nodes_evaluated += candidate_budget.nodes_evaluated;
         }
 
         // "Fully completed" also requires the deadline to be live after the
@@ -3488,6 +3531,7 @@ fn run_iterative_deepening(
             completed: accepted,
             nodes_used: budget.nodes_evaluated,
             max_nodes: budget.max_nodes,
+            root_nodes_used,
         });
 
         if accepted {
@@ -3529,10 +3573,9 @@ fn run_iterative_deepening(
 
 /// Deterministic principal-variation selection over a completed rung's scores.
 /// Budget-allocation policy, not alpha-beta: root siblings share one per-rung
-/// `SearchBudget` (constructed once per rung in `run_iterative_deepening`) and
-/// each opens a fresh `(-inf, +inf)` window, so PV-first spends the shared pool
-/// on the strongest known candidate before the tail starves — no alpha carries
-/// between root siblings.
+/// `SearchBudget` with reserved quotas for the remaining roots, and each opens
+/// a fresh `(-inf, +inf)` window. PV-first spends its own quota first and leaves
+/// unused node headroom for later roots; no alpha carries between siblings.
 ///
 /// NaN-safe: `unwrap_or(Equal)` defers to the `cmp_stable` total order so ties
 /// and non-finite scores resolve deterministically, never a bare
@@ -3588,6 +3631,7 @@ pub(crate) fn build_ai_context_with_session(
         session,
         player,
         deadline: engine::util::Deadline::none(),
+        combo_plan: None,
     };
     // Compute opponent threat profile based on difficulty setting.
     ctx.opponent_threat = match config.search.threat_awareness {
@@ -6692,10 +6736,9 @@ mod tests {
             .expect("the reducer must issue the test spell root cast")
     }
 
-    /// Drive the AI through a real cast of Self-Destruct where the opponent has
-    /// BOTH a big body the 2/2 source cannot kill (a non-lethal waste) and a
-    /// small body it CAN kill (a clean lethal kill). The tactical target
-    /// selection must pick the lethal small body over the survivable big one.
+    /// After announcing Self-Destruct, target selection must pick a body the
+    /// source can kill instead of wasting it on a survivable body. This is not
+    /// a claim that trading a card AND a 2/2 for a 0/1 is worth initiating.
     #[test]
     fn self_destruct_target_selection_prefers_lethal_over_nonlethal_body() {
         use engine::parser::oracle::parse_oracle_text;
@@ -6721,12 +6764,30 @@ mod tests {
         let wizard_a = add_creature(&mut state, P1, 0, 1);
         let wizard_b = add_creature(&mut state, P1, 0, 1);
 
-        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        // Keep lookahead focused on the exchange rather than an incidental
+        // empty-library terminal score. The fixture has no deck by default.
+        for player in [P0, P1] {
+            for index in 0..40 {
+                create_object(
+                    &mut state,
+                    CardId(100 + index),
+                    player,
+                    "Library filler".to_string(),
+                    Zone::Library,
+                );
+            }
+        }
+        let cast = root_cast_candidate(&state, spell);
+        engine::game::engine::apply_as_current(&mut state, cast.action)
+            .expect("announce the spell through the real reducer");
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::TargetSelection { .. }
+        ));
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native).into_measurement(7);
         let mut rng = SmallRng::seed_from_u64(7);
 
-        // Drive the AI through the full decision sequence (cast → source target
-        // → recipient target), exactly as the game loop replays candidate
-        // actions, and record every object it picks as a ChooseTarget target.
+        // Let the AI choose both source and recipient through real prompts.
         let mut picked: Vec<ObjectId> = Vec::new();
         for _ in 0..20 {
             let Some(action) = choose_action(&state, P0, &config, &mut rng) else {
@@ -12516,6 +12577,53 @@ mod tests {
 
     // V6: the rung witness records completion + node usage for every executed rung.
     #[test]
+    fn insufficient_root_budget_preserves_shallow_scores() {
+        let state = searchable_state();
+        let mut config = create_config(AiDifficulty::Hard, Platform::Native).into_measurement(7);
+        config.search.max_nodes = 0;
+        let policies = PolicyRegistry::shared();
+        let ranked = {
+            let services = PlannerServices::new_default(PlayerId(0), &config, policies);
+            build_root_beam(&state, &services)
+        };
+        assert!(ranked.len() >= 2);
+        let mut shallow = config.clone();
+        shallow.search.planner_mode = PlannerMode::BeamOnly;
+        let mut shallow_services = PlannerServices::new_default(PlayerId(0), &shallow, policies);
+        let expected =
+            run_iterative_deepening(&state, ranked.clone(), 0.1, &shallow, &mut shallow_services);
+        let mut services = PlannerServices::new_default(PlayerId(0), &config, policies);
+        let actual = run_iterative_deepening(&state, ranked, 0.1, &config, &mut services);
+        assert_eq!(actual, expected);
+        assert_eq!(services.rung_stats.len(), 1);
+        assert_eq!(services.rung_stats[0].depth, 0);
+        assert_eq!(services.rung_stats[0].nodes_used, 0);
+    }
+
+    #[test]
+    fn root_budget_reserves_nodes_for_later_candidates() {
+        let state = searchable_state();
+        let mut config = create_config(AiDifficulty::Hard, Platform::Native).into_measurement(7);
+        config.search.max_depth = 2;
+        config.search.rollout_depth = 0;
+        let ranked = {
+            let services =
+                PlannerServices::new_default(PlayerId(0), &config, PolicyRegistry::shared());
+            build_root_beam(&state, &services)
+        };
+        assert!(ranked.len() >= 2);
+        config.search.max_nodes = ranked.len() as u32;
+        let mut services =
+            PlannerServices::new_default(PlayerId(0), &config, PolicyRegistry::shared());
+        let scores = run_iterative_deepening(&state, ranked, 0.1, &config, &mut services);
+        let searched = services.rung_stats.last().unwrap();
+        assert_eq!(searched.depth, 1);
+        assert_eq!(searched.root_nodes_used.len(), scores.len());
+        assert!(searched.root_nodes_used.iter().all(|&nodes| nodes > 0));
+        assert!(searched.nodes_used <= searched.max_nodes);
+    }
+
+    #[test]
     fn rung_stats_record_completion_and_node_usage() {
         let state = searchable_state();
         let policies = PolicyRegistry::shared();
@@ -12630,19 +12738,13 @@ mod tests {
         assert!(pv_argmax(&[]).is_none(), "empty input yields None");
     }
 
-    // V3: the rung-1 PV rotate steers the shared per-rung budget to the PV
-    // candidate. Budget-starvation fixture: a tight node cap means the first-
-    // searched root subtree drains the pool. With the rotate, the PV candidate B
-    // is searched FIRST at rung 2, so its rung-2 score equals its independent
-    // full-depth continuation (computed on FRESH services). Reverting the rotate
-    // makes A drain the pool first and B collapse toward quiesced eval.
     #[test]
-    fn pv_rotate_gives_pv_candidate_full_depth_under_starvation() {
+    fn pv_rotate_preserves_reserved_budget_for_siblings() {
         let state = starvation_state();
         let policies = PolicyRegistry::shared();
         let mut config = create_config(AiDifficulty::Hard, Platform::Native).into_measurement(7);
         config.search.max_depth = 3; // ceiling 2 (rung 1 sets PV, rung 2 uses it)
-        config.search.max_nodes = 6; // tight: one root subtree drains the pool
+        config.search.max_nodes = 6;
         let tw = 0.1;
 
         // Beam deliberately ordered PASS-FIRST so ranked[0] = A = pass while the
@@ -12673,12 +12775,10 @@ mod tests {
         let b_tactical = b_ranked.score;
         let b_sim = apply_candidate(&state, &b_ranked.candidate).expect("B applies");
 
-        // Independent full-depth control on FRESH services (empty TT) + fresh
-        // budget. `eval_cache` is a pure-function memo (value-transparent), so only
-        // the TT could contaminate the comparison — guarded below by tt_hits == 0.
         let control_cont = {
             let mut fresh = PlannerServices::new_default(PlayerId(0), &config, policies);
-            let mut fresh_budget = SearchBudget::new(config.search.max_nodes);
+            let mut fresh_budget =
+                SearchBudget::new(config.search.max_nodes).for_root_candidate(ranked.len());
             let planner = BeamContinuationPlanner {
                 depth: 2,
                 rollout_depth: config.search.rollout_depth,
@@ -12722,11 +12822,17 @@ mod tests {
                 .any(|r| r.depth >= 1 && r.nodes_used >= r.max_nodes),
             "a searched rung saturated the node pool (the starvation regime)"
         );
+        let deepest = services.rung_stats.last().unwrap();
+        assert_eq!(deepest.root_nodes_used, vec![3, 3]);
+        assert_eq!(
+            deepest.root_nodes_used.iter().sum::<u32>(),
+            deepest.nodes_used
+        );
 
         let out_b = score_of(&out, &b);
         assert!(
             (out_b - (control_cont + b_tactical * tw)).abs() < 1e-9,
-            "PV-first gives B its full-depth continuation value \
+            "PV-first gives B its quota-bounded continuation value \
              (got {out_b}, expected {})",
             control_cont + b_tactical * tw
         );

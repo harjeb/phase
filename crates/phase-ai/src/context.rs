@@ -38,6 +38,7 @@ pub struct AiContext {
     /// deadline ticks down we fall back to cached-only lookups and a
     /// heuristic score.
     pub deadline: engine::util::Deadline,
+    pub combo_plan: Option<Arc<crate::combo::ComboPlan>>,
 }
 
 static EMPTY_SYNERGY_GRAPH: std::sync::OnceLock<SynergyGraph> = std::sync::OnceLock::new();
@@ -94,6 +95,7 @@ impl AiContext {
             session,
             player,
             deadline: engine::util::Deadline::none(),
+            combo_plan: None,
         }
     }
 
@@ -108,6 +110,7 @@ impl AiContext {
             session: Arc::new(AiSession::empty()),
             player: PlayerId(0),
             deadline: engine::util::Deadline::none(),
+            combo_plan: None,
         }
     }
 

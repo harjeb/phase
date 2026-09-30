@@ -16,7 +16,7 @@ const LEGACY_SCORE_LITERAL_COUNTS: &[(&str, usize)] = &[
     ("card_advantage.rs", 1),
     ("chalice_avoidance.rs", 1),
     ("combat_tax.rs", 3),
-    ("combo_line.rs", 3),
+    ("combo_line.rs", 0),
     ("condition_gated_activation.rs", 1),
     ("control_change_awareness.rs", 6),
     ("effect_timing.rs", 1),

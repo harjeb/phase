@@ -3,7 +3,7 @@
 //! Verifies that all layers wired across Phases 1-8 of the cEDH implementation
 //! are correctly connected: config preset values, 4-player paranoid-scaling
 //! bypass, `DeckFeatures::is_cedh`, `ComboLinePolicy` registration, and the
-//! stub `ComboRegistry` entry.
+//! structural combo registry and engine-verified action plans.
 
 use std::sync::Arc;
 
@@ -11,13 +11,11 @@ use engine::ai_support::legal_actions;
 use engine::game::bracket_estimate::CommanderBracketTier;
 use engine::game::deck_loading::DeckEntry;
 use engine::game::zones::create_object;
-use engine::types::ability::{AbilityCost, AbilityDefinition, AbilityKind, Effect};
 use engine::types::actions::GameAction;
 use engine::types::card::CardFace;
 use engine::types::card_type::CoreType;
 use engine::types::game_state::{GameState, PlayerDeckPool, WaitingFor};
 use engine::types::identifiers::{CardId, ObjectId};
-use engine::types::mana::{ManaCost, ManaCostShard};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
@@ -43,40 +41,37 @@ use phase_ai::search::{choose_action, score_candidates, select_safe_action_from_
 /// - `Phase::PreCombatMain`, `PlayerId(0)` has priority.
 /// - Two untapped Plains satisfy Heliod's `{1}{W}` cost via the legacy
 ///   land-mana fallback (no `AbilityDefinition` needed on the land objects).
-/// - Heliod at `abilities[0]` with `{1}{W}` — name-exact so the combo
-///   detector fires.
-/// - Walking Ballista at `abilities[0]` (placeholder, `NoCost`) and
-///   `abilities[1]` (damage step, `NoCost`).
+/// - Heliod and Walking Ballista use their actual parsed costs and effects.
+/// - Walking Ballista starts with two +1/+1 counters and can pay its damage cost.
 /// - `PlayerId(0)`'s `PlayerDeckPool` has a non-empty `current_main` so
 ///   `build_ai_context` propagates the tier through `DeckFeatures::analyze`.
-fn cedh_combo_state_with_synthetic_abilities(
+fn cedh_combo_state_with_parsed_cards(
     tier: CommanderBracketTier,
 ) -> (GameState, ObjectId, ObjectId) {
-    let mut state = GameState::new_two_player(0);
-
+    use engine::game::printed_cards::apply_card_face_to_object;
+    use engine::types::counter::CounterType;
+    let cards: std::collections::HashMap<String, CardFace> =
+        serde_json::from_str(include_str!("../src/combo/fixtures/cards.json")).unwrap();
+    let mut state = GameState::new_two_player(42);
+    state.turn_number = 3;
     state.phase = Phase::PreCombatMain;
     state.active_player = PlayerId(0);
     state.priority_player = PlayerId(0);
     state.waiting_for = WaitingFor::Priority {
         player: PlayerId(0),
     };
-
-    // Two untapped Plains — legacy mana fallback synthesizes {T}: Add {W} per
-    // land without needing an explicit AbilityDefinition.
-    for i in 0..2 {
-        let land_id = create_object(
+    for index in 0..2 {
+        let land = create_object(
             &mut state,
-            CardId(100 + i),
+            CardId(100 + index),
             PlayerId(0),
             "Plains".to_string(),
             Zone::Battlefield,
         );
-        let obj = state.objects.get_mut(&land_id).unwrap();
-        obj.card_types.core_types.push(CoreType::Land);
-        obj.card_types.subtypes.push("Plains".to_string());
+        let object = state.objects.get_mut(&land).unwrap();
+        object.card_types.core_types.push(CoreType::Land);
+        object.card_types.subtypes.push("Plains".to_string());
     }
-
-    // Heliod, Sun-Crowned — abilities[0] = {1}{W} activated ability.
     let heliod_id = create_object(
         &mut state,
         CardId(200),
@@ -84,29 +79,10 @@ fn cedh_combo_state_with_synthetic_abilities(
         "Heliod, Sun-Crowned".to_string(),
         Zone::Battlefield,
     );
-    {
-        let obj = state.objects.get_mut(&heliod_id).unwrap();
-        obj.card_types.core_types.push(CoreType::Creature);
-        obj.entered_battlefield_turn = Some(0);
-        let mut ability = AbilityDefinition::new(
-            AbilityKind::Activated,
-            Effect::Unimplemented {
-                name: "test_heliod_lifelink".to_string(),
-                description: None,
-            },
-        );
-        ability.cost = Some(AbilityCost::Mana {
-            cost: ManaCost::Cost {
-                shards: vec![ManaCostShard::White],
-                generic: 1,
-            },
-        });
-        Arc::make_mut(&mut obj.abilities).push(ability);
-    }
-
-    // Walking Ballista — abilities[0] = placeholder (NoCost), abilities[1] =
-    // damage step (NoCost).  The combo policy checks `(source_id,
-    // ability_index)` only; effects are `Unimplemented`.
+    apply_card_face_to_object(
+        state.objects.get_mut(&heliod_id).unwrap(),
+        &cards["heliod, sun-crowned"],
+    );
     let ballista_id = create_object(
         &mut state,
         CardId(201),
@@ -114,53 +90,39 @@ fn cedh_combo_state_with_synthetic_abilities(
         "Walking Ballista".to_string(),
         Zone::Battlefield,
     );
-    {
-        let obj = state.objects.get_mut(&ballista_id).unwrap();
-        obj.card_types.core_types.push(CoreType::Creature);
-        obj.entered_battlefield_turn = Some(0);
-        let mut placeholder = AbilityDefinition::new(
-            AbilityKind::Activated,
-            Effect::Unimplemented {
-                name: "test_ballista_growth".to_string(),
-                description: None,
-            },
-        );
-        placeholder.cost = Some(AbilityCost::Mana {
-            cost: ManaCost::NoCost,
-        });
-        let mut damage = AbilityDefinition::new(
-            AbilityKind::Activated,
-            Effect::Unimplemented {
-                name: "test_ballista_damage".to_string(),
-                description: None,
-            },
-        );
-        damage.cost = Some(AbilityCost::Mana {
-            cost: ManaCost::NoCost,
-        });
-        let abilities = Arc::make_mut(&mut obj.abilities);
-        abilities.push(placeholder);
-        abilities.push(damage);
-    }
-
-    let dummy_entry = DeckEntry {
+    let ballista = state.objects.get_mut(&ballista_id).unwrap();
+    apply_card_face_to_object(ballista, &cards["walking ballista"]);
+    ballista.entered_battlefield_turn = Some(0);
+    ballista.summoning_sick = false;
+    ballista.counters.insert(CounterType::Plus1Plus1, 2);
+    let entry = DeckEntry {
         card: CardFace::default(),
         count: 1,
     };
-    state.deck_pools.clear();
     state.deck_pools.push(PlayerDeckPool {
         player: PlayerId(0),
-        current_main: Arc::new(vec![dummy_entry.clone()]),
+        current_main: Arc::new(vec![entry.clone()]),
         bracket_tier: tier,
-        ..PlayerDeckPool::default()
+        ..Default::default()
     });
     state.deck_pools.push(PlayerDeckPool {
         player: PlayerId(1),
-        current_main: Arc::new(vec![dummy_entry]),
+        current_main: Arc::new(vec![entry]),
         bracket_tier: CommanderBracketTier::Core,
-        ..PlayerDeckPool::default()
+        ..Default::default()
     });
-
+    for player in [PlayerId(0), PlayerId(1)] {
+        for _ in 0..12 {
+            let card_id = CardId(state.next_object_id);
+            create_object(
+                &mut state,
+                card_id,
+                player,
+                "Library Filler".to_string(),
+                Zone::Library,
+            );
+        }
+    }
     (state, heliod_id, ballista_id)
 }
 
@@ -208,7 +170,7 @@ fn cedh_full_stack_smoke() {
         "PolicyRegistry::default() must register ComboLinePolicy"
     );
 
-    // 6. ComboRegistry ships with at least one stub combo line to prove
+    // 6. ComboRegistry ships with structurally matched combo templates to prove
     //    end-to-end wiring (real cEDH lines are a follow-up phase).
     let combo_reg = ComboRegistry::default();
     assert!(
@@ -225,28 +187,18 @@ fn cedh_full_stack_smoke() {
 /// configures both players' `PlayerDeckPool::bracket_tier = Cedh`, and runs
 /// `phase_ai::search::score_candidates` — the full planner entry point.
 ///
-/// The assertion is that the Heliod activation outscores `PassPriority` (the
-/// always-legal no-op baseline). The only mechanism by which Heliod activation
-/// can outscore PassPriority on this synthetic state is the `ComboLinePolicy`
-/// firing its `combo_progress_this_turn_bonus`, which proves the full chain:
-///
-///   `PlayerDeckPool::bracket_tier = Cedh`
-///     -> `DeckFeatures::is_cedh = true`
-///     -> `ComboLinePolicy::activation() = Some(1.0)`
-///     -> `ComboRegistry::reachable_lines()` returns Heliod/Ballista
-///     -> `verdict()` applies the bonus to the Heliod activation candidate
-///     -> `score_candidates()` returns the boosted score
-///
-/// This is the *only* end-to-end test in the suite that exercises the wiring
-/// through `build_ai_context` and `tactical_score`'s full policy registry —
-/// the per-policy unit tests in `policies/combo_line.rs` construct
-/// `PolicyContext` by hand with `AiContext::empty()`, which bypasses
-/// `build_ai_context` (the production path that turns deck-pool tier into the
-/// `is_cedh` flag the policy gates on).
+/// Verifies that the prepared plan prefers the setup activation and that
+/// disabling only the combo bonus lowers its score on the identical state.
+/// This isolates policy wiring from the real abilities' intrinsic value.
 #[test]
 fn score_candidates_boosts_heliod_combo_activation_for_cedh_ai() {
-    let (state, heliod_id, ballista_id) =
-        cedh_combo_state_with_synthetic_abilities(CommanderBracketTier::Cedh);
+    let (state, heliod_id, _) = cedh_combo_state_with_parsed_cards(CommanderBracketTier::Cedh);
+    let prepared =
+        phase_ai::combo::plan_combos(&state, PlayerId(0), 48, engine::util::Deadline::none());
+    assert!(
+        prepared.plan.is_some(),
+        "the production combo quota must find a witness: {prepared:?}"
+    );
 
     // Sanity guard: the engine must offer the Heliod activation as a legal
     // priority action. If this fails the test is mis-set-up and the
@@ -296,70 +248,27 @@ fn score_candidates_boosts_heliod_combo_activation_for_cedh_ai() {
             )
         });
 
-    // CR-irrelevant: this is a wiring assertion, not a rules one.
-    // `combo_progress_this_turn_bonus = 15.0` (cEDH preset). Inside
-    // `score_candidates`, the tactical signal — which is where the policy
-    // delta lives — is scaled by `tactical_weight = 0.1` before being added
-    // to the continuation rollout score, so the visible separation per
-    // combo step is `15.0 * 1.0 * 0.1 = 1.5` plus any continuation noise.
-    //
-    // Two assertions guard against regressions in different wiring layers:
-    //   (a) Heliod activation must outscore PassPriority — proves the
-    //       activation candidate at least clears the always-legal baseline.
-    //   (b) At least one of the combo-line steps (Heliod[0] or Ballista[1])
-    //       must dominate PassPriority by at least `+1.0`. The combo bonus
-    //       is the only mechanism on this synthetic state that can push
-    //       any activation that far above PassPriority — so a passing
-    //       assertion proves the chain
-    //         `PlayerDeckPool::bracket_tier = Cedh` ->
-    //         `DeckFeatures::is_cedh = true` ->
-    //         `ComboLinePolicy::activation()` ->
-    //         `ComboRegistry::reachable_lines()` ->
-    //         `verdict()` bonus ->
-    //         `score_candidates` output
-    //       is wired end-to-end.
     assert!(
         heliod_score > pass_score,
         "Heliod combo activation must outscore PassPriority for a cEDH AI \
          (heliod_score = {heliod_score}, pass_score = {pass_score}, scored = {scored:?})"
     );
 
-    let ballista_damage_score = scored
+    let mut without_bonus = config.clone();
+    without_bonus
+        .policy_penalties
+        .combo_progress_this_turn_bonus = 0.0;
+    let ablated = score_candidates(&state, PlayerId(0), &without_bonus);
+    let ablated_heliod_score = ablated
         .iter()
-        .find(|(action, _)| {
-            matches!(
-                action,
-                GameAction::ActivateAbility {
-                    source_id,
-                    ability_index: 1,
-                } if *source_id == ballista_id
-            )
-        })
-        .map(|(_, s)| *s);
-
-    let best_combo_step_score = ballista_damage_score
-        .map(|b| heliod_score.max(b))
-        .unwrap_or(heliod_score);
-
-    // Derive the minimum acceptable margin from the config value rather than
-    // hardcoding it.  Inside `score_candidates`, the raw policy bonus is
-    // dampened by `tactical_weight = 0.1` (the main-phase, non-stack-response
-    // branch in `search.rs`; not exposed as a named constant).  We require the
-    // visible margin to be at least half of that dampened bonus, so the
-    // assertion trips if `tactical_weight` drops below ~0.034 (half of the
-    // current 0.067 trip-point) while still tolerating small weight retunings.
-    let expected_full_bonus = config.policy_penalties.combo_progress_this_turn_bonus;
-    // 0.1 = tactical_weight for main-phase, non-target-selection in search.rs
-    let min_margin = expected_full_bonus * 0.1 * 0.5;
+        .find(|(action, _)| *action == heliod_activation)
+        .map(|(_, score)| *score)
+        .expect("Heliod activation must remain legal without the combo bonus");
+    let min_lift = config.policy_penalties.combo_progress_this_turn_bonus * 0.1 * 0.5;
     assert!(
-        best_combo_step_score - pass_score > min_margin,
-        "At least one Heliod/Ballista combo step must dominate PassPriority \
-         by at least {min_margin:.3} (~50% of damped policy bonus) — \
-         combo_progress_this_turn_bonus is not reaching score_candidates \
-         output (best combo diff = {:.3}, heliod = {heliod_score}, \
-         ballista[1] = {ballista_damage_score:?}, pass = {pass_score}, \
-         scored = {scored:?})",
-        best_combo_step_score - pass_score
+        heliod_score - ablated_heliod_score > min_lift,
+        "The combo policy must lift the same setup action by at least {min_lift:.3}: \
++         enabled = {heliod_score}, ablated = {ablated_heliod_score}"
     );
 }
 
@@ -382,7 +291,7 @@ fn choose_action_picks_combo_activation_for_cedh_ai() {
     use rand::SeedableRng;
 
     let (state, heliod_id, ballista_id) =
-        cedh_combo_state_with_synthetic_abilities(CommanderBracketTier::Cedh);
+        cedh_combo_state_with_parsed_cards(CommanderBracketTier::Cedh);
     let config = create_config(AiDifficulty::CEDH, Platform::Native).into_measurement(42);
 
     let mut smoke_rng = SmallRng::seed_from_u64(0);
@@ -432,57 +341,18 @@ fn choose_action_picks_combo_activation_for_cedh_ai() {
 /// gate on `is_cedh`, which is a real wiring regression.
 #[test]
 fn choose_action_does_not_boost_combo_without_is_cedh() {
-    use rand::rngs::SmallRng;
-    use rand::SeedableRng;
-
-    let (state, heliod_id, ballista_id) =
-        cedh_combo_state_with_synthetic_abilities(CommanderBracketTier::Core);
-    // Difficulty stays CEDH so the only variable is the deck tier / is_cedh flag.
+    use rand::{rngs::SmallRng, SeedableRng};
+    let (state, _, _) = cedh_combo_state_with_parsed_cards(CommanderBracketTier::Core);
     let config = create_config(AiDifficulty::CEDH, Platform::Native).into_measurement(42);
-
-    let mut smoke_rng = SmallRng::seed_from_u64(0);
-    assert!(
-        choose_action(&state, PlayerId(0), &config, &mut smoke_rng).is_some(),
-        "choose_action smoke must return a legal action"
-    );
-
+    let mut random = SmallRng::seed_from_u64(42);
+    assert!(choose_action(&state, PlayerId(0), &config, &mut random).is_some());
     let scored = score_candidates(&state, PlayerId(0), &config);
-    assert!(
-        !scored.is_empty(),
-        "score_candidates returned no candidates"
-    );
-
-    let mut combo_count = 0u32;
-    for seed in 0..50u64 {
-        let mut rng = SmallRng::seed_from_u64(seed);
-        let action = select_safe_action_from_scores(&state, &scored, config.temperature, &mut rng);
-        if matches!(
-            action,
-            Some(GameAction::ActivateAbility {
-                source_id,
-                ability_index,
-            }) if (source_id == heliod_id && ability_index == 0)
-                || (source_id == ballista_id && ability_index == 1)
-        ) {
-            combo_count += 1;
-        }
-    }
-
-    // On this synthetic state the only legal actions are PassPriority,
-    // Heliod[0] (needs mana, so often absent from scored output), and
-    // Ballista[0]/Ballista[1] (NoCost). Without the combo bonus the two
-    // Ballista activations score about the same as PassPriority and the
-    // softmax naturally picks them ~40-50 % of the time by base-rate alone.
-    // The threshold here must therefore lie *between* that base-rate upper
-    // bound (≤ 35, empirically ~27 without the bonus) and the ≥ 40 that the
-    // positive test requires. A combo_count ≥ 35 is the signal that the bonus
-    // is leaking — it would push selection to the same >80 % territory we
-    // measure in the positive test.
-    assert!(
-        combo_count < 35,
-        "expected fewer than 35/50 trials to pick a combo activation when \
-         bracket_tier = Core (is_cedh = false); got {combo_count}/50 — the \
-         ComboLinePolicy bonus appears to be firing even without the cEDH flag \
-         set (heliod_id = {heliod_id:?}, ballista_id = {ballista_id:?})"
+    let mut ablated = config.clone();
+    ablated.policy_penalties.combo_progress_this_turn_bonus = 0.0;
+    assert!(!scored.is_empty());
+    assert_eq!(
+        scored,
+        score_candidates(&state, PlayerId(0), &ablated),
+        "changing the combo bonus must not change scores for a non-cEDH deck"
     );
 }
