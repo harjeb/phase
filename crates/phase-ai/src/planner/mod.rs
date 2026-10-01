@@ -2488,6 +2488,8 @@ mod tests {
             valid_block_targets: left_targets,
             block_requirements: left_requirements,
             blocker_constraints: Default::default(),
+            must_be_blocked_targets: Default::default(),
+            block_capacities: Default::default(),
         };
 
         let mut right = make_state();
@@ -2497,6 +2499,8 @@ mod tests {
             valid_block_targets: right_targets,
             block_requirements: right_requirements,
             blocker_constraints: Default::default(),
+            must_be_blocked_targets: Default::default(),
+            block_capacities: Default::default(),
         };
 
         assert_eq!(candidate_cache_key(&left), candidate_cache_key(&right));

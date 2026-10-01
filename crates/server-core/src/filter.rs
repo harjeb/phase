@@ -410,6 +410,7 @@ mod tests {
             enters_attacking: false,
             owner_library: false,
             track_exiled_by_source: false,
+            face_down_in_exile: engine::types::ability::ExileConcealment::Public,
             face_down_profile: None,
             enter_with_counters: vec![],
             conditional_enter_with_counters: vec![],
@@ -489,6 +490,7 @@ mod tests {
             enters_attacking: false,
             owner_library: false,
             track_exiled_by_source: false,
+            face_down_in_exile: engine::types::ability::ExileConcealment::Public,
             face_down_profile: None,
             enter_with_counters: vec![],
             conditional_enter_with_counters: vec![],
@@ -502,7 +504,7 @@ mod tests {
             enters_modified_if: None,
             duration: None,
         };
-        state.pending_mass_library_order_choice = Some(PendingMassLibraryOrderChoice {
+        state.pending_mass_library_order_choice = Some(Box::new(PendingMassLibraryOrderChoice {
             source_id: ObjectId(100),
             library_position: LibraryPosition::Bottom,
             track_exiled_by_source: false,
@@ -517,7 +519,7 @@ mod tests {
                     })
                     .collect(),
             }]),
-        });
+        }));
 
         let filtered = filter_state_for_player(&state, PlayerId(1));
         match filtered.waiting_for {

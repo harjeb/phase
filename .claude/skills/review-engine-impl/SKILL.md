@@ -1,5 +1,5 @@
 ---
-name: review-impl
+name: review-engine-impl
 description: Review an implementation in scope, such as an uncommitted diff, a just-finished agent change, a commit, or named files, for missing or wrong behavior in phase.rs. Use when Codex needs a findings-only architecture and correctness review across engine, parser, frontend, multiplayer, AI, deck, build, or release changes.
 ---
 
@@ -39,7 +39,7 @@ Maintainer-Simulation Gate: PASS|FAIL
 
 `Review Head` must be the supplied `CANDIDATE_SHA`, and the reviewed diff must reproduce from exactly `BASE_SHA..CANDIDATE_SHA`; otherwise report a blocking finding.
 
-`Completion Gate` passes when every check the changed surface calls for was run against the committed candidate and passed: formatting for implementation changes, the Rust/engine/parser block for Rust paths, the frontend block for frontend paths, the parser gate for parser paths. Check the set against the candidate diff rather than against the plan, and re-run anything you doubt — you have the candidate SHA and a shell. A check run against uncommitted edits, or against a different tree, does not count. Markdown-only policy work needs scope and diff checks only. In all engine-implementer review modes, additional checks must address a concrete unresolved claim within the original task. Follow the orchestrator's [task scope](../engine-implementer/SKILL.md#task-scope-and-verification-work) and [run limits](../engine-implementer/SKILL.md#run-limits); do not independently construct or repair verification machinery. Return missing evidence to the orchestrator without claiming completion, including when a proposed probe needs redesign before it can run. This does not waive required checks or current-candidate evidence.
+`Completion Gate` passes when every check [engine-implementer Step 5](../engine-implementer/SKILL.md#step-5--verify-the-committed-candidate) calls for on the changed surface was run against the committed candidate and passed. Check the set against the candidate diff rather than against the plan, and re-run anything you doubt — you have the candidate SHA and a shell. A check run against uncommitted edits, or against a different tree, does not count. In all engine-implementer review modes, additional checks must address a concrete unresolved claim within the original task. Follow the orchestrator's [task scope](../engine-implementer/SKILL.md#task-scope-and-verification-work) and [run limits](../engine-implementer/SKILL.md#run-limits); do not independently construct or repair verification machinery. Return missing evidence to the orchestrator without claiming completion, including when a proposed probe needs redesign before it can run. This does not waive required checks or current-candidate evidence.
 
 ## Phase Mode (chartered runs)
 
@@ -132,6 +132,8 @@ Use this exact finding shape:
 ```text
 **[HIGH/MED/LOW]** <short summary>. Evidence: <path:line>. Why it matters: <one sentence>. Suggested fix: <one line>.
 ```
+
+In engine-implementer reviews, including the final PR review, append the orchestrator's tag to each finding — `[behavior]`, `[text]` or `[machinery]`, as its [run limits](../engine-implementer/SKILL.md#run-limits) define them; when in doubt, `[behavior]`. A `[text]` finding quotes the old text and gives the replacement. A finding that names a pattern gives the predicate, the command, and every matching site with its disposition; that list is the fix's scope. On a fix round, check the fix executor's unrequested edits first: a sentence added beyond the prior finding's supplied text is the least-reviewed line in the diff.
 
 Severity calibration: a latent bug — one not reachable today because a guard or parser blocks it — is still a finding. Rate it by what happens when the form is reached or the guard removed, not by today's reachability: if it then produces a wrong result for a card-class the feature appears to cover, it is at least MED, and "unreachable today" belongs in the evidence, not as a reason to downgrade to LOW. A feature that ships silently incorrect for a sub-class it looks like it handles (e.g. a multi-die roll that overwrites the stored result each iteration instead of supporting the aggregate) is a MED the maintainer must see — never a NIT.
 

@@ -1,8 +1,16 @@
-import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type Dispatch,
+  type MutableRefObject,
+  type SetStateAction,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { useLocation, useNavigate } from "react-router";
 
-import type { GameFormat } from "../adapter/types";
+import type { GameFormat, JoinTargetInfo } from "../adapter/types";
 import { useAudioContext } from "../audio/useAudioContext";
 import { DiscordBadge } from "../components/chrome/DiscordBadge";
 import { ScreenChrome } from "../components/chrome/ScreenChrome";
@@ -20,6 +28,7 @@ import { MenuPanel, MenuShell } from "../components/menu/MenuShell";
 import { menuButtonClass } from "../components/menu/buttonStyles";
 import { MyDecks } from "../components/menu/MyDecks";
 import { ACTIVE_DECK_KEY, loadActiveDeck, touchDeckPlayed } from "../constants/storage";
+import { withSavedDeckLibraryOrSkip } from "../services/savedDeckTransaction";
 import { parseRoomCode, stripPeerIdPrefix } from "../network/connection";
 import { evaluateDeckCompatibility } from "../services/deckCompatibility";
 import { expandParsedDeck } from "../services/deckParser";
@@ -52,9 +61,12 @@ import {
 } from "../stores/multiplayerStore";
 import { DEFAULT_MULTIPLAYER_SERVER_URL, OFFICIAL_MULTIPLAYER_SERVER_URL } from "../config/multiplayerServer";
 import {
+  DRAFT_OFFLINE_ERROR,
+  isMultiplayerDraftPodLive,
   useMultiplayerDraftStore,
-  type MultiplayerDraftPhase,
+  type DraftSessionOpenOutcome,
 } from "../stores/multiplayerDraftStore";
+import { assertNever } from "../utils/assertNever";
 import { useGameStore, saveActiveGame } from "../stores/gameStore";
 import { useCardDataStore } from "../stores/cardDataStore";
 import { useEffectiveOffline } from "../stores/connectivityStore";
@@ -69,7 +81,7 @@ type BuildUpdateDialog =
   | { status: "manual"; link: ActionableBotLink; arrival: number };
 
 function parseViewParam(value: string | null): MultiplayerView {
-  if (value === "host-setup" || value === "deck-select" || value === "draft-lobby") return value;
+  if (value === "host-setup" || value === "deck-select") return value;
   return "lobby";
 }
 
@@ -117,23 +129,43 @@ export function MultiplayerPage() {
   ));
 
   useEffect(() => {
-    if (!effectiveOffline || view === "draft-lobby" || view === "lobby") return;
+    if (!effectiveOffline || view === "lobby") return;
     setView("lobby");
   }, [effectiveOffline, view]);
+
+  // Lobby joins this route has started but not yet settled. The
+  // `resolveP2PDialTarget` round trip and the `joinDraft` connection attempt
+  // it feeds outlive a navigation away from `/multiplayer`, and an abandoned
+  // one must not go on to seat this browser in a pod nobody is looking at.
+  // Owned here rather than by `MultiplayerPageContent`, which unmounts and
+  // remounts every time `effectiveOffline` flips — a join still in flight
+  // when the browser goes offline mid-connect is exactly the one whose own
+  // "failed" outcome should still surface, since `joinDraft` itself refuses
+  // offline.
+  const pendingLobbyJoins = useRef(new Set<AbortController>());
+  useEffect(() => {
+    const pending = pendingLobbyJoins.current;
+    return () => {
+      for (const join of pending) join.abort();
+      pending.clear();
+    };
+  }, []);
 
   if (effectiveOffline) {
     return <MultiplayerOfflineUnavailable onHome={() => navigate("/")} />;
   }
 
-  return <MultiplayerPageContent view={view} setView={setView} />;
+  return <MultiplayerPageContent view={view} setView={setView} pendingLobbyJoins={pendingLobbyJoins} />;
 }
 
 function MultiplayerPageContent({
   view,
   setView,
+  pendingLobbyJoins,
 }: {
   view: MultiplayerView;
   setView: Dispatch<SetStateAction<MultiplayerView>>;
+  pendingLobbyJoins: MutableRefObject<Set<AbortController>>;
 }) {
   const { t } = useTranslation("multiplayer");
   useAudioContext("lobby");
@@ -160,10 +192,7 @@ function MultiplayerPageContent({
   const startP2PHostingSession = useMultiplayerStore((s) => s.startP2PHostingSession);
   const showToast = useMultiplayerStore((s) => s.showToast);
 
-  const draftPhase = useMultiplayerDraftStore((s) => s.phase);
-  const draftRoomCode = useMultiplayerDraftStore((s) => s.roomCode);
   const joinDraft = useMultiplayerDraftStore((s) => s.joinDraft);
-  const leaveDraft = useMultiplayerDraftStore((s) => s.leave);
 
   const [activeDeckName, setActiveDeckName] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
@@ -411,8 +440,7 @@ function MultiplayerPageContent({
   const resolveGuestFromStore = useMultiplayerStore((s) => s.resolveGuest);
   const lookupJoinTargetFromStore = useMultiplayerStore((s) => s.lookupJoinTarget);
 
-  // The single user-driven reload site; never reloads a live game (a draft-pod
-  // lobby renders on this page).
+  // The single user-driven reload site; never reloads a live game.
   const reloadOrToast = useCallback(() => {
     if (!reloadIfNoLiveGame()) showToast(t("page.refreshAfterGame"));
   }, [showToast, t]);
@@ -438,33 +466,29 @@ function MultiplayerPageContent({
    * Guest-path P2P resolve loop. Tries `resolveGuest` over the shared
    * subscription socket, prompts for a password on `password_required`
    * and retries on the same socket, surfaces explicit UI for
-   * `build_mismatch` / `connection_lost` / etc., and navigates on
-   * success. No `throw`-based control flow: failures come back as a
-   * discriminated `ResolveResult`.
+   * `build_mismatch` / `connection_lost` / etc., and returns the stripped
+   * host peer id to dial on success, or `null` once the failure's own UI
+   * has been shown. No `throw`-based control flow: failures come back as
+   * a discriminated `ResolveResult`.
    *
-   * Declared above `executeAction` so the deck-select → re-dispatch
-   * path can route LobbyOnly joins through the broker too. `setJoinErrorDialog`
-   * is referenced as an identifier (stable across renders via React).
+   * `setJoinErrorDialog` is referenced as an identifier (stable across
+   * renders via React).
    */
-  const joinP2PRoom = useCallback(
+  const resolveP2PDialTarget = useCallback(
     async (
       code: string,
       origin: LobbySource,
       initialPassword?: string,
-    ): Promise<boolean> => {
+    ): Promise<string | null> => {
       let password = initialPassword;
       while (true) {
         const result = await resolveGuestFromStore(code, origin, password);
         if (result.ok) {
-          const gameId = crypto.randomUUID();
-          useGameStore.setState({ gameId });
-          const roomCode = stripPeerIdPrefix(result.peerInfo.host_peer_id);
-          navigate(`/game/${gameId}?mode=p2p-join&code=${roomCode}`);
-          return true;
+          return stripPeerIdPrefix(result.peerInfo.host_peer_id);
         }
         if (result.reason === "password_required") {
           const entered = window.prompt(t("page.passwordPrompt"));
-          if (!entered) return false;
+          if (!entered) return null;
           password = entered;
           continue;
         }
@@ -477,7 +501,7 @@ function MultiplayerPageContent({
               onClick: () => void refreshToLatestBuild(),
             },
           });
-          return false;
+          return null;
         }
         if (
           result.reason === "not_found" ||
@@ -487,13 +511,31 @@ function MultiplayerPageContent({
             title: t("page.joinErrorCantJoinTitle"),
             message: result.message,
           });
-          return false;
+          return null;
         }
         showToast(result.message);
-        return false;
+        return null;
       }
     },
-    [navigate, refreshToLatestBuild, resolveGuestFromStore, showToast, t],
+    [refreshToLatestBuild, resolveGuestFromStore, showToast, t],
+  );
+
+  // Declared above `executeAction` so the deck-select → re-dispatch
+  // path can route LobbyOnly joins through the broker too.
+  const joinP2PRoom = useCallback(
+    async (
+      code: string,
+      origin: LobbySource,
+      initialPassword?: string,
+    ): Promise<boolean> => {
+      const roomCode = await resolveP2PDialTarget(code, origin, initialPassword);
+      if (roomCode === null) return false;
+      const gameId = crypto.randomUUID();
+      useGameStore.setState({ gameId });
+      navigate(`/game/${gameId}?mode=p2p-join&code=${roomCode}`);
+      return true;
+    },
+    [navigate, resolveP2PDialTarget],
   );
 
   // Execute a pending action (host or join) with the currently active deck.
@@ -548,7 +590,7 @@ function MultiplayerPageContent({
         }
       }
 
-      touchDeckPlayed(deckName);
+      void withSavedDeckLibraryOrSkip((txn) => touchDeckPlayed(txn, deckName), "run-unguarded");
 
       if (action.type === "host") {
         const deck = expandDeck();
@@ -590,26 +632,21 @@ function MultiplayerPageContent({
 
         const store = useMultiplayerStore.getState();
         // A dedicated game server and the lobby broker can both be connected.
-        // Preserve a custom broker anchor, but never use a Full server for
-        // P2P registration. Unknown custom endpoints are probed before deciding.
         // A Discord host (`requestedCode`) registers on the build's official
         // broker regardless of the browsing anchor: that is the broker its
         // guest links name.
-        const anchor = store.hostingServer;
-        let target = action.connectionMode === "p2p"
-          ? action.settings.requestedCode !== undefined
-            ? OFFICIAL_MULTIPLAYER_SERVER_URL
-            : anchor !== null && store.sourceStatus.get(anchor)?.serverInfo?.mode !== "Full"
-              ? anchor
-              : OFFICIAL_MULTIPLAYER_SERVER_URL
-          : action.serverUrl;
-        let socket = target === null
-          ? null
-          : await store.ensureSubscriptionSocket(target);
-        if (action.connectionMode === "p2p" && socket?.serverInfo.mode === "Full") {
-          target = OFFICIAL_MULTIPLAYER_SERVER_URL;
-          socket = await store.ensureSubscriptionSocket(target);
-        }
+        const resolved = action.connectionMode === "p2p"
+          ? await store.resolveP2PBroker(
+              action.settings.requestedCode !== undefined
+                ? OFFICIAL_MULTIPLAYER_SERVER_URL
+                : store.hostingServer,
+            )
+          : {
+              url: action.serverUrl,
+              socket: action.serverUrl === null ? null : await store.ensureSubscriptionSocket(action.serverUrl),
+            };
+        const target = resolved.url;
+        const socket = resolved.socket;
 
         if (action.connectionMode === "p2p") {
           if (socket?.serverInfo.mode !== "LobbyOnly") {
@@ -705,19 +742,74 @@ function MultiplayerPageContent({
     navigate("/draft?mode=multiplayer");
   }, [navigate]);
 
-  // Join a draft pod from the lobby. Draft entries carry `draft_metadata`
-  // and are always P2P — the guest joins via PeerJS room code.
+  // Join a P2P draft pod from the lobby. A row's `game_code` names the
+  // broker listing, not the host's PeerJS room — the room to dial is the
+  // host peer the broker returns from `resolveP2PDialTarget`.
   const handleJoinDraftFromLobby = useCallback(
-    async (code: string, _context?: LobbyGame) => {
-      const playerName = useMultiplayerStore.getState().displayName ?? "Player";
+    async (
+      code: string,
+      origin: LobbySource | null,
+      password: string | undefined,
+      target: Pick<LobbyGame, "is_p2p">,
+    ) => {
+      if (target.is_p2p !== true) {
+        showToast(t("page.serverDraftJoinUnsupported"));
+        return;
+      }
+      if (isMultiplayerDraftPodLive(useMultiplayerDraftStore.getState())) {
+        showToast(t("page.alreadyInDraftPod"));
+        return;
+      }
+      if (origin === null) {
+        showToast(t("page.joinNeedsServer"));
+        return;
+      }
+      const join = new AbortController();
+      pendingLobbyJoins.current.add(join);
+      let outcome: DraftSessionOpenOutcome;
       try {
-        await joinDraft({ kind: "new", roomCode: code, displayName: playerName });
-        setView("draft-lobby");
+        const roomCode = await resolveP2PDialTarget(code, origin, password);
+        // A pod session started during the broker round trip is newer than
+        // this click, and `joinDraft` would replace it — the same is true of
+        // the player having left this page while the round trip was in flight.
+        if (roomCode === null || join.signal.aborted) return;
+        if (isMultiplayerDraftPodLive(useMultiplayerDraftStore.getState())) return;
+        const playerName = useMultiplayerStore.getState().displayName ?? "Player";
+        outcome = await joinDraft(
+          { kind: "new", roomCode, displayName: playerName, signal: join.signal },
+          { failureReport: "caller" },
+        );
       } catch {
         showToast(t("page.failedToJoinDraft"));
+        return;
+      } finally {
+        // Before the switch below navigates: leaving `join` in the set past
+        // this point would let the unmount effect's cleanup abort it, and on
+        // an "opened" outcome that signal is now the session's own
+        // route-abort listener — tearing the session back down right after
+        // it opened.
+        pendingLobbyJoins.current.delete(join);
+      }
+      switch (outcome.status) {
+        case "opened":
+          // `entry=guest`: a reload of `/draft-pod` then recovers this guest
+          // seat, never a saved hosted pod.
+          navigate("/draft-pod?entry=guest");
+          return;
+        case "superseded":
+          return;
+        case "failed":
+          showToast(
+            outcome.error !== null && outcome.error !== DRAFT_OFFLINE_ERROR
+              ? outcome.error
+              : t("page.failedToJoinDraft"),
+          );
+          return;
+        default:
+          assertNever(outcome);
       }
     },
-    [joinDraft, showToast, t],
+    [joinDraft, navigate, resolveP2PDialTarget, showToast, t],
   );
 
   const handleSpectate = useCallback(
@@ -728,22 +820,28 @@ function MultiplayerPageContent({
         showToast(t("page.joinNeedsServer"));
         return;
       }
+      // Every spectate navigation carries the origin — the draft-spectator
+      // socket opens on it exactly as the game socket does.
+      const spectatorParams = new URLSearchParams({ code, server: origin.url });
+      const watchDraft = (target: Pick<LobbyGame, "is_p2p">) => {
+        if (target.is_p2p === true) {
+          showToast(t("page.p2pDraftSpectateUnsupported"));
+          return;
+        }
+        navigate(`/draft-spectator?${spectatorParams.toString()}`);
+      };
       // Scoped to the authority being watched (non-null past the guard): a
       // `game_code` is unique per server, so an unscoped rescan could pick a
       // colliding row from another source and route a game to the draft
       // spectator (or the reverse).
       const resolved = context ?? findLobbyGameByCode(code, origin.url)?.game;
-      // Every spectate navigation carries the origin — the draft-spectator
-      // socket opens on it exactly as the game socket does.
-      const spectatorParams = new URLSearchParams({ code, server: origin.url });
       if (resolved?.draft_metadata) {
-        navigate(`/draft-spectator?${spectatorParams.toString()}`);
+        watchDraft(resolved);
         return;
       }
-      // Past the branch above, `resolved` carries no draft metadata. Typed
-      // codes skip lobby-row context entirely, and a draft that is not in the
-      // public lobby still resolves via SpectateDraft when lookup reports
-      // not_found.
+      // Past the branch above, `resolved` carries no draft metadata. A draft
+      // that is not in the public lobby still resolves via SpectateDraft when
+      // lookup reports not_found.
       const lookup = await lookupJoinTargetFromStore(code, origin);
       if (!lookup.ok && lookup.reason === "not_found") {
         navigate(`/draft-spectator?${spectatorParams.toString()}`);
@@ -751,6 +849,10 @@ function MultiplayerPageContent({
       }
       if (!lookup.ok) {
         showToast(lookup.message);
+        return;
+      }
+      if (lookup.info.draft_metadata) {
+        watchDraft(lookup.info);
         return;
       }
       const gameId = crypto.randomUUID();
@@ -772,14 +874,20 @@ function MultiplayerPageContent({
       context?: LobbyGame,
       onNotFound?: () => void,
     ) => {
+      const trimmedCode = code.trim();
+
       // Draft entries bypass the normal join-with-deck flow entirely — draft
-      // pods handle their own deck building after the draft completes.
-      if (context?.draft_metadata) {
-        void handleJoinDraftFromLobby(code, context);
+      // pods handle their own deck building after the draft completes. A
+      // row click already carries `context`; a typed code of a listed pod
+      // is recovered from the join origin's own listing, mirroring
+      // `handleSpectate`'s scoped `findLobbyGameByCode` lookup.
+      const listed =
+        context ?? (origin !== null ? findLobbyGameByCode(trimmedCode, origin.url)?.game : undefined);
+      if (listed?.draft_metadata) {
+        void handleJoinDraftFromLobby(trimmedCode, origin, password, listed);
         return;
       }
 
-      const trimmedCode = code.trim();
       const directP2PCode = parseRoomCode(trimmedCode);
 
       // Raw 5-character room codes are direct PeerJS joins with no server
@@ -804,41 +912,40 @@ function MultiplayerPageContent({
         return;
       }
 
-      // Typed-code path (no lobby-row context) uses the read-only
-      // `LookupJoinTarget` RPC so the deck picker can filter by format
+      // The read-only `LookupJoinTarget` RPC lets the deck picker filter by format
       // without accidentally consuming a seat on Full servers.
-      let resolvedFormat = format;
       let resolvedPassword = password;
-      let resolvedIsP2P = context?.is_p2p === true;
-      const result = await lookupJoinTargetFromStore(code, origin, resolvedPassword);
-      if (result.ok) {
-        resolvedFormat = result.info.format_config?.format ?? resolvedFormat;
-        resolvedIsP2P = result.info.is_p2p;
-      } else if (result.reason === "password_required") {
+      let info: JoinTargetInfo;
+      const first = await lookupJoinTargetFromStore(code, origin, resolvedPassword);
+      if (first.ok) {
+        info = first.info;
+      } else if (first.reason === "password_required") {
         const entered = window.prompt(t("page.passwordPrompt"));
         if (!entered) return;
         resolvedPassword = entered;
         const retry = await lookupJoinTargetFromStore(code, origin, resolvedPassword);
-        if (retry.ok) {
-          resolvedFormat = retry.info.format_config?.format ?? resolvedFormat;
-          resolvedIsP2P = retry.info.is_p2p;
-        } else {
+        if (!retry.ok) {
           showToast(retry.message);
           return;
         }
-      } else if (result.reason === "not_found" && onNotFound) {
+        info = retry.info;
+      } else if (first.reason === "not_found" && onNotFound) {
         onNotFound();
         return;
       } else {
-        showToast(result.message);
+        showToast(first.message);
+        return;
+      }
+      if (info.draft_metadata) {
+        void handleJoinDraftFromLobby(trimmedCode, origin, resolvedPassword, info);
         return;
       }
       const action: PendingAction = {
         type: "join",
         code,
         password: resolvedPassword,
-        format: resolvedFormat,
-        isP2P: resolvedIsP2P,
+        format: info.format_config?.format ?? format,
+        isP2P: info.is_p2p,
         origin,
         context,
       };
@@ -995,11 +1102,6 @@ function MultiplayerPageContent({
       setView("lobby");
       return;
     }
-    if (view === "draft-lobby") {
-      void leaveDraft();
-      setView("lobby");
-      return;
-    }
     navigate("/");
   };
 
@@ -1021,20 +1123,16 @@ function MultiplayerPageContent({
       ? t("page.titleLobby")
       : view === "host-setup"
         ? t("page.titleHostSetup")
-        : view === "draft-lobby"
-          ? t("page.titleDraftLobby")
-          : t("page.titleDeckSelect");
+        : t("page.titleDeckSelect");
 
   const description =
     view === "lobby"
       ? t("page.descriptionLobby")
       : view === "host-setup"
         ? t("page.descriptionHostSetup")
-        : view === "draft-lobby"
-          ? t("page.descriptionDraftLobby")
-          : selectedFormat
-            ? t("page.descriptionDeckSelectFormat", { format: selectedFormat })
-            : t("page.descriptionDeckSelect");
+        : selectedFormat
+          ? t("page.descriptionDeckSelectFormat", { format: selectedFormat })
+          : t("page.descriptionDeckSelect");
 
   return (
     <div className="menu-scene relative flex min-h-screen flex-col overflow-hidden">
@@ -1164,17 +1262,6 @@ function MultiplayerPageContent({
                   ? t("deckLegalityChip.checkingLegality")
                   : undefined
             }
-          />
-        )}
-
-        {view === "draft-lobby" && (
-          <DraftLobbyPanel
-            phase={draftPhase}
-            roomCode={draftRoomCode}
-            onLeave={() => {
-              void leaveDraft();
-              setView("lobby");
-            }}
           />
         )}
 
@@ -1314,89 +1401,6 @@ function MultiplayerOfflineUnavailable({ onHome }: { onHome: () => void }) {
         </MenuPanel>
       </MenuShell>
     </div>
-  );
-}
-
-// ── Draft Lobby Panel ─────────────────────────────────────────────────
-//
-// Minimal inline panel shown when the user has joined (as guest) a
-// multiplayer draft pod. Displays connection status, room code, and a
-// leave button. The full draft UI lives on the DraftPage; this panel is
-// a holding area while waiting in the pod lobby.
-
-function DraftLobbyPanel({
-  phase,
-  roomCode,
-  onLeave,
-}: {
-  phase: MultiplayerDraftPhase;
-  roomCode: string | null;
-  onLeave: () => void;
-}) {
-  const { t } = useTranslation("multiplayer");
-  const seats = useMultiplayerDraftStore((s) => s.seats);
-  const joined = useMultiplayerDraftStore((s) => s.joined);
-  const total = useMultiplayerDraftStore((s) => s.total);
-  const error = useMultiplayerDraftStore((s) => s.error);
-
-  return (
-    <MenuPanel className="relative z-10 flex w-full max-w-3xl flex-col gap-5 px-5 py-6">
-      <div className="flex items-center justify-between">
-        <div className="text-[0.68rem] uppercase tracking-[0.22em] text-slate-500">
-          {t("draftLobbyPanel.draftPod")}
-        </div>
-        {roomCode && (
-          <span className="rounded-[6px] border border-white/10 bg-black/25 px-2.5 py-0.5 font-mono text-xs tracking-wider text-purple-300">
-            {roomCode}
-          </span>
-        )}
-      </div>
-
-      {phase === "connecting" && (
-        <div className="text-sm text-slate-400">{t("draftLobbyPanel.connecting")}</div>
-      )}
-
-      {phase === "error" && (
-        <div className="rounded-[10px] border border-rose-400/20 bg-rose-500/[0.07] px-4 py-3 text-sm text-rose-200 shadow-[0_8px_22px_rgba(0,0,0,0.18)] backdrop-blur-sm">
-          {error ?? t("draftLobbyPanel.connectionFailed")}
-        </div>
-      )}
-
-      {(phase === "lobby" || phase === "connecting") && total > 0 && (
-        <div className="flex flex-col gap-3">
-          <div className="text-sm text-slate-300">
-            {t("draftLobbyPanel.playersJoined", { joined, total })}
-          </div>
-          <div className="flex flex-wrap gap-2">
-            {seats.map((seat, i) => (
-              <div
-                key={i}
-                className={`rounded-lg border px-3 py-1.5 text-xs ${
-                  seat.display_name
-                    ? "border-purple-400/20 bg-purple-500/[0.07] text-purple-200"
-                    : "border-white/8 bg-black/16 text-slate-500"
-                }`}
-              >
-                {seat.display_name || t("draftLobbyPanel.seat", { number: i + 1 })}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {phase === "drafting" && (
-        <div className="text-sm text-emerald-300">
-          {t("draftLobbyPanel.draftInProgress")}
-        </div>
-      )}
-
-      <button
-        onClick={onLeave}
-        className={menuButtonClass({ tone: "neutral", size: "sm" })}
-      >
-        {t("draftLobbyPanel.leaveDraft")}
-      </button>
-    </MenuPanel>
   );
 }
 

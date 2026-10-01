@@ -11,7 +11,7 @@ use crate::types::card_type::{
 };
 use crate::types::mana::{ManaColor, ManaCost};
 use nom::branch::alt;
-use nom::bytes::complete::{tag, take_until};
+use nom::bytes::complete::{tag, take_till, take_until};
 use nom::character::complete::{alpha1, anychar, space1};
 use nom::combinator::{eof, map_res, opt, peek, recognize, value, verify};
 use nom::multi::many_till;
@@ -243,6 +243,20 @@ pub fn strip_after<'a>(text: &'a str, needle: &str) -> Option<&'a str> {
 pub fn split_around<'a>(text: &'a str, needle: &str) -> Option<(&'a str, &'a str)> {
     text.find(needle)
         .map(|pos| (&text[..pos], &text[pos + needle.len()..]))
+}
+
+/// The choice clause's own sentence: everything up to the first `.`.
+///
+/// Shared by the as-enters classifier retry and the replacement builder's
+/// fallback so both derive the SAME object phrase from a two-sentence line —
+/// naming it twice is the drift that rejects Haktos's full line in one layer
+/// while the other accepts it. Nom `take_till`, not `split_once`: parser
+/// dispatch goes through combinators from the first line. Returns the whole
+/// input when it carries no `.`; callers trim.
+pub fn first_sentence(text: &str) -> &str {
+    take_till::<_, _, OracleError<'_>>(|c| c == '.')
+        .parse(text)
+        .map_or(text, |(_, head)| head)
 }
 
 /// Split a modeled static sentence from a following "The same is true for ..."
@@ -478,11 +492,13 @@ pub fn parse_count_expr(text: &str) -> Option<(QuantityExpr, &str)> {
         }
     }
 
-    // CR 608.2c: "that many" / "that much" — an anaphoric back-reference to the
-    // previous effect's count (read the whole text and apply the rules of
-    // English). Resolves to `EventContextAmount` (which falls back to
-    // `state.last_effect_count` for chained sub-ability
-    // continuations). Composes with the "twice"/"three times" multipliers
+    // CR 608.2c: "that many" / "that much" / "that number of" — an
+    // anaphoric back-reference to the previous effect's count (read the whole
+    // text and apply the rules of English). Resolves to `EventContextAmount`
+    // (which falls back to `state.last_effect_count` for chained sub-ability
+    // continuations); a governing gate that measured the antecedent later
+    // rebinds the placeholder to its own `QuantityRef`. Composes with the
+    // "twice"/"three times" multipliers
     // above so "twice that many cards" parses as Multiply{2, EventContextAmount}.
     if let Some(((), rest)) = super::oracle_nom::bridge::nom_on_lower(text, &lower, |i| {
         nom::combinator::value(
@@ -490,6 +506,7 @@ pub fn parse_count_expr(text: &str) -> Option<(QuantityExpr, &str)> {
             nom::branch::alt((
                 nom::bytes::complete::tag::<_, _, OracleError<'_>>("that many"),
                 nom::bytes::complete::tag("that much"),
+                nom::bytes::complete::tag("that number of"),
             )),
         )
         .parse(i)
@@ -4291,6 +4308,32 @@ mod tests {
         assert_eq!(rest, "stun counters");
     }
 
+    /// CR 608.2c: the demonstrative count phrases — "that many", "that much",
+    /// and "that number of" — all parse to the unbound `EventContextAmount`
+    /// placeholder and leave the counted noun as the remainder.
+    #[test]
+    fn parse_count_expr_demonstrative_count_phrases() {
+        for (text, expected_rest) in [
+            (
+                "that number of +1/+1 counters on target creature",
+                "+1/+1 counters on target creature",
+            ),
+            ("that many +1/+1 counters", "+1/+1 counters"),
+            ("that much life", "life"),
+        ] {
+            let (qty, rest) = parse_count_expr(text)
+                .unwrap_or_else(|| panic!("{text:?} must parse as a count expression"));
+            assert_eq!(
+                qty,
+                QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount
+                },
+                "{text:?} must be the EventContextAmount placeholder"
+            );
+            assert_eq!(rest, expected_rest, "{text:?} must leave the noun phrase");
+        }
+    }
+
     /// CR 107.1b: "equal to" in count positions must compose full quantity
     /// expressions, not just bare `QuantityRef` leaves (Tormented Thoughts /
     /// Ulamog enter-with-counters class).
@@ -4883,6 +4926,26 @@ mod tests {
         // Cross-string (lower/original) patterns must use find() on lowered + manual slicing.
         assert_eq!(strip_after("Hello World", "hello"), None);
         assert_eq!(strip_after("Hello World", "Hello"), Some(" World"));
+    }
+
+    // --- first_sentence tests ---
+
+    #[test]
+    fn first_sentence_cuts_at_the_first_period() {
+        assert_eq!(
+            super::first_sentence("choose 2, 3, or 4 at random. Haktos has protection."),
+            "choose 2, 3, or 4 at random"
+        );
+    }
+
+    #[test]
+    fn first_sentence_returns_the_whole_input_without_a_period() {
+        assert_eq!(super::first_sentence("choose a color"), "choose a color");
+    }
+
+    #[test]
+    fn first_sentence_of_empty_is_empty() {
+        assert_eq!(super::first_sentence(""), "");
     }
 
     // --- TextPair::strip_after tests ---

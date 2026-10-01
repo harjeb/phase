@@ -552,6 +552,9 @@ pub fn apply_debug_action(
             state.priority_player = active_player;
             state.combat = None;
             state.stack.clear();
+            // CR 701.20a: every reveal lease is bound to a stack entry that
+            // this jump just removed.
+            state.release_all_stack_bound_reveals();
             state.waiting_for = WaitingFor::Priority {
                 player: active_player,
             };
@@ -727,11 +730,10 @@ pub fn apply_debug_action(
     // A genuine no-op for all non-declaration waiting states.
     super::combat::refresh_combat_declaration_waiting_for(state);
 
-    Ok(ActionResult {
-        events: std::mem::take(events),
-        waiting_for: state.waiting_for.clone(),
-        log_entries: vec![],
-    })
+    Ok(ActionResult::applied(
+        std::mem::take(events),
+        state.waiting_for.clone(),
+    ))
 }
 
 /// CR 122.1: Apply a final debug-selected player-counter delta through the
@@ -856,11 +858,7 @@ pub fn route_debug_create_to_battlefield(
         let req = crate::game::zone_pipeline::ZoneMoveRequest::debug(object_id, Zone::Battlefield);
         crate::game::zone_pipeline::move_object(state, req, &mut events);
         crate::game::layers::mark_layers_full(state);
-        return ActionResult {
-            events,
-            waiting_for: state.waiting_for.clone(),
-            log_entries: vec![],
-        };
+        return ActionResult::applied(events, state.waiting_for.clone());
     }
 
     if state
@@ -872,11 +870,7 @@ pub fn route_debug_create_to_battlefield(
     }
 
     enter_battlefield_with_etb(state, object_id, attach_to, &mut events);
-    ActionResult {
-        events,
-        waiting_for: state.waiting_for.clone(),
-        log_entries: vec![],
-    }
+    ActionResult::applied(events, state.waiting_for.clone())
 }
 
 /// CR 614.12 + CR 603.6a: Move an existing object onto the battlefield through
@@ -909,6 +903,7 @@ fn enter_battlefield_with_etb(
         controller_override: None,
         enter_transformed: false,
         face_down_profile: None,
+        face_down_in_exile: crate::types::ability::ExileConcealment::Public,
         chain_referent: crate::types::zones::ChainReferentIntent::Silent,
         enter_as_copy: None,
         discard_frame: None,
@@ -1041,11 +1036,7 @@ fn route_debug_token_to_battlefield(
                         event,
                     });
                     state.waiting_for = waiting_for;
-                    return ActionResult {
-                        events,
-                        waiting_for: state.waiting_for.clone(),
-                        log_entries: vec![],
-                    };
+                    return ActionResult::applied(events, state.waiting_for.clone());
                 }
             }
             if super::effects::token::commit_liminal_token_entry_and_continue_copy_batch(
@@ -1065,11 +1056,7 @@ fn route_debug_token_to_battlefield(
         }
     }
 
-    ActionResult {
-        events,
-        waiting_for: state.waiting_for.clone(),
-        log_entries: vec![],
-    }
+    ActionResult::applied(events, state.waiting_for.clone())
 }
 
 /// Bind a debug card request to its complete printed characteristics before a
@@ -1079,6 +1066,7 @@ pub fn debug_card_entry_source(db: &CardDatabase, face: &CardFace) -> DebugCardE
     DebugCardEntrySource {
         face: face.clone(),
         back_face: super::printed_cards::back_face_for_card_face(db, face),
+        outside_game_faces: super::printed_cards::outside_game_faces_for(face, db),
     }
 }
 
@@ -1123,11 +1111,7 @@ pub fn create_debug_cards(
     let debug_action = request.as_debug_action();
     preflight_debug_action(state, request.actor, &debug_action)?;
     if request.count == 0 {
-        return Ok(ActionResult {
-            events: vec![],
-            waiting_for: state.waiting_for.clone(),
-            log_entries: vec![],
-        });
+        return Ok(ActionResult::applied(vec![], state.waiting_for.clone()));
     }
     let description = debug_action.describe(state);
     let before = state.clone();
@@ -1169,11 +1153,7 @@ pub fn create_debug_cards(
                 events.extend(entry.events);
             }
         }
-        ActionResult {
-            events,
-            waiting_for: state.waiting_for.clone(),
-            log_entries: vec![],
-        }
+        ActionResult::applied(events, state.waiting_for.clone())
     } else {
         drain_debug_card_entries(
             state,
@@ -1187,11 +1167,7 @@ pub fn create_debug_cards(
             },
             &mut events,
         );
-        ActionResult {
-            events,
-            waiting_for: state.waiting_for.clone(),
-            log_entries: vec![],
-        }
+        ActionResult::applied(events, state.waiting_for.clone())
     };
     result.events.push(GameEvent::DebugActionUsed {
         player_id: actor,
@@ -1288,6 +1264,9 @@ fn materialize_debug_card(
     creation_kind: DebugCardCreationKind,
     initial_zone: Zone,
 ) -> ObjectId {
+    // CR 701.42a: a card entering mid-game can reach the same outside-the-game
+    // faces (its meld pair's combined back) as one that started in the game.
+    super::printed_cards::extend_card_face_registry(state, &source.outside_game_faces);
     // CR 400.7: The object receives an identity only at the point its own
     // entry starts; unattempted batch members are not game objects yet.
     let card_id = CardId(state.next_object_id);
@@ -1496,6 +1475,7 @@ mod tests {
                         ..Default::default()
                     },
                     back_face: None,
+                    outside_game_faces: Default::default(),
                 },
                 owner: PlayerId(9),
                 zone: Zone::Hand,
@@ -1523,6 +1503,7 @@ mod tests {
                         ..Default::default()
                     },
                     back_face: None,
+                    outside_game_faces: Default::default(),
                 },
                 owner: PlayerId(0),
                 zone: Zone::Hand,
@@ -1573,6 +1554,7 @@ mod tests {
                 ..Default::default()
             },
             back_face: None,
+            outside_game_faces: Default::default(),
         };
 
         let result = create_debug_cards(
@@ -1620,6 +1602,7 @@ mod tests {
                     ..Default::default()
                 },
                 back_face: None,
+                outside_game_faces: Default::default(),
             },
             owner: PlayerId(0),
             attach_to: None,
@@ -1677,6 +1660,7 @@ mod tests {
                         ..Default::default()
                     },
                     back_face: None,
+                    outside_game_faces: Default::default(),
                 },
                 owner: PlayerId(0),
                 zone: Zone::Battlefield,

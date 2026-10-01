@@ -4,15 +4,15 @@ use std::collections::{HashMap, HashSet};
 use rand::seq::SliceRandom;
 
 use crate::types::ability::{
-    AbilityCost, ChoiceType, ChosenAttribute, DigRestOrder, Effect, EffectKind,
+    AbilityCost, ChoiceType, ChosenAttribute, DigRestOrder, DigRestSplitScope, Effect, EffectKind,
     ForwardedResultContext, GuessOutcome, LibraryPosition, QuantityExpr, QuantityRef,
     ReciprocalZoneChoiceRole, ResolvedAbility, TargetRef,
 };
 use crate::types::actions::{GameAction, LearnOption, OutsideGameSelection};
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
-    ActionResult, CastOfferKind, ChosenDamageSource, CopyChosenSelection, GameState,
-    OutsideGameChoiceSource, PayableResource, PendingContinuation,
+    ActionResult, BatchCompletion, CastOfferKind, ChosenDamageSource, CopyChosenSelection,
+    GameState, OutsideGameChoiceSource, PayableResource, PendingContinuation,
     PendingPlayerScopeSacrificeCompletion, PersistentAxisMaterialization, WaitingFor,
     ZoneOpponentChooserPurpose,
 };
@@ -26,7 +26,10 @@ use super::effects;
 use super::engine::EngineError;
 use super::turns;
 use super::zones;
-use super::{casting, casting_costs, engine_priority, mana_abilities, public_state};
+use super::{
+    casting, casting_costs, engine_priority, mana_abilities, payment_transaction, public_state,
+    zone_pipeline,
+};
 
 /// A fresh mass library-order prompt is valid only for
 /// the exact member identities and origins frozen by its producer. Prompt cards
@@ -894,6 +897,7 @@ pub(super) fn handles(waiting_for: &WaitingFor) -> bool {
             }
             | WaitingFor::RippleRevealChoice { .. }
             | WaitingFor::RippleBottomOrder { .. }
+            | WaitingFor::RevealUntilBottomOrder { .. }
             | WaitingFor::CastOffer {
                 kind: CastOfferKind::FreeCastWindow { .. },
                 ..
@@ -909,6 +913,7 @@ pub(super) fn handles(waiting_for: &WaitingFor) -> bool {
             | WaitingFor::SeparatePilesPartition { .. }
             | WaitingFor::SeparatePilesChoice { .. }
             | WaitingFor::DigChoice { .. }
+            | WaitingFor::DigRestSplitChoice { .. }
             | WaitingFor::SurveilChoice { .. }
             | WaitingFor::RevealChoice { .. }
             | WaitingFor::SearchChoice { .. }
@@ -1053,6 +1058,211 @@ pub(crate) fn route_rest_partition_then(
     )
 }
 
+/// CR 401.2 + CR 401.4 + CR 701.20d: Route a Telling Time-class remainder
+/// split — `top_ids` to the top of the library, `bottom_ids` to its bottom — as
+/// ONE simultaneous batch, so the deferred dig tail behind `completion` runs
+/// exactly once no matter how the two piles settle.
+///
+/// This is `route_rest_partition_then` with the `LibraryPosition` lifted from a
+/// constant to a per-card value; it deliberately reuses the identical
+/// `ZoneMoveRequest::effect(..).at_library_position(..)` primitive rather than
+/// introducing a second way to reach the library. Every card here is already IN
+/// the library — a dig looks at cards without moving them (CR 701.20b/e) — so
+/// each request takes `move_to_library_at_index`'s `from == Zone::Library`
+/// early return into `reorder_within_library`, which advances the library
+/// knowledge epoch (CR 701.20d: reordered revealed cards stop being revealed and
+/// become new objects) and re-marks top-of-library statics on its own. No
+/// manual epoch bookkeeping belongs here.
+///
+/// `top_ids` is submitted back-to-front so the caller's first-listed card ends
+/// up topmost, matching CR 401.4's "the owner may arrange them in any order".
+pub(crate) fn route_rest_split_then(
+    state: &mut GameState,
+    top_ids: &[ObjectId],
+    bottom_ids: &[ObjectId],
+    source_id: Option<ObjectId>,
+    completion: Option<crate::types::game_state::BatchCompletion>,
+    events: &mut Vec<GameEvent>,
+) -> crate::game::zone_pipeline::BatchMoveResult {
+    let requests = top_ids
+        .iter()
+        .rev()
+        .map(|&id| (id, LibraryPosition::Top))
+        .chain(bottom_ids.iter().map(|&id| (id, LibraryPosition::Bottom)))
+        .map(|(obj_id, position)| {
+            crate::game::zone_pipeline::ZoneMoveRequest::effect(
+                obj_id,
+                Zone::Library,
+                source_id.unwrap_or(obj_id),
+            )
+            .at_library_position(position)
+        })
+        .collect();
+    crate::game::zone_pipeline::move_objects_simultaneously_then(
+        state, requests, completion, events,
+    )
+}
+
+/// CR 401.2 + CR 701.20e + CR 608.2c: Hand a Telling Time-class remainder pile
+/// to the player who looked at it, to split between the top and the bottom of
+/// the library it came from. `top_count` is already resolved (CR 608.2c fixes
+/// it as the effect is applied) and is clamped to the pile size here, since a
+/// short library can leave fewer remainder cards than the text names.
+///
+/// The library owner is derived from the pile rather than passed in: the cards
+/// never left the library they were looked at in (CR 701.20b/e), so their
+/// owner IS that library's owner, and deriving it here keeps the one source of
+/// that fact next to the move that depends on it.
+///
+/// CR 401.4 governs the prompt condition, and it is about ARRANGEMENT, not
+/// partition: "if an effect puts two or more cards in a specific position in a
+/// library at the same time, the owner of those cards may arrange them in any
+/// order." A unique partition is therefore NOT a unique arrangement. A
+/// degenerate split (`top_count == 0`, or `top_count == pile.len()`) sends the
+/// whole pile to ONE position, and the moment that pile holds two or more
+/// cards CR 401.4 hands its order to the owner — exactly the choice
+/// `ripple::open_bottom_order_or_place` raises for its own all-to-the-bottom
+/// pile at `cards.len() >= 2`.
+///
+/// So the single gate is `pile.len() >= 2`, which subsumes both decisions:
+///
+/// * `pile.len() < 2` — one position, one card (or none). Neither a partition
+///   nor an order exists; route immediately with no prompt.
+/// * `pile.len() >= 2` — at least one real decision exists. Either the
+///   partition is genuine (`0 < top_count < pile.len()`), or it is degenerate
+///   and the single destination position now holds 2+ cards whose order is the
+///   owner's under CR 401.4. Both are answered by the same submission.
+///
+/// The response is a full permutation of `pile` (see
+/// [`validate_dig_rest_split_selection`]), the same contract
+/// `WaitingFor::RippleBottomOrder` already uses for its own "in any order"
+/// pile — one prompt carries both the partition and both piles' orders, rather
+/// than chaining a second and third prompt for the same instruction.
+///
+/// WHO answers it depends on whether the two decisions have the same owner:
+///
+/// * `player == library_owner` (every printed card today — a dig of "your
+///   library") — one [`DigRestSplitScope::PartitionAndOrder`] prompt, exactly
+///   as before.
+/// * `player != library_owner` (a dig of "target player's library") — the two
+///   decisions belong to two different players and must be asked separately.
+///   CR 608.2d gives the partition to the chooser and CR 401.4 gives each 2+
+///   card pile's arrangement to the LIBRARY'S OWNER, so a genuine partition
+///   parks [`DigRestSplitScope::PartitionOnly`] for the chooser first, and a
+///   degenerate one (`top_count == 0` or `== pile.len()`, where the partition
+///   was never a decision) skips straight to the owner's
+///   [`DigRestSplitScope::OrderOnly`] prompt.
+fn split_rest_pile_or_park(
+    state: &mut GameState,
+    player: crate::types::player::PlayerId,
+    pile: &[ObjectId],
+    top_count: usize,
+    source_id: Option<ObjectId>,
+    completion: crate::types::game_state::BatchCompletion,
+    events: &mut Vec<GameEvent>,
+) -> crate::game::zone_pipeline::BatchMoveResult {
+    let top_count = top_count.min(pile.len());
+    if pile.len() < 2 {
+        // CR 401.4 does not apply below two cards, and a 0-or-1-card pile has
+        // exactly one legal arrangement. `split_at` is total here because
+        // `top_count` was just clamped to `pile.len()`.
+        let (top, bottom) = pile.split_at(top_count);
+        return route_rest_split_then(state, top, bottom, source_id, Some(completion), events);
+    }
+    let library_owner = pile
+        .first()
+        .and_then(|id| state.objects.get(id))
+        .map_or(player, |obj| obj.owner);
+    // CR 608.2d + CR 401.4: one prompt only while one player owns both
+    // decisions. Otherwise the partition is the chooser's and the arrangement
+    // is the owner's, and a degenerate partition is no decision at all — so
+    // there is nothing to ask the chooser and the owner is asked directly.
+    let scope = if player == library_owner {
+        DigRestSplitScope::PartitionAndOrder
+    } else if top_count == 0 || top_count == pile.len() {
+        DigRestSplitScope::OrderOnly
+    } else {
+        DigRestSplitScope::PartitionOnly
+    };
+    state.waiting_for = WaitingFor::new_dig_rest_split(
+        player,
+        library_owner,
+        pile.to_vec(),
+        top_count,
+        scope,
+        source_id,
+        Some(Box::new(completion)),
+    );
+    crate::game::zone_pipeline::BatchMoveResult::Done
+}
+
+/// CR 401.2 + CR 401.4 + CR 608.2c: Validate a `DigRestSplitChoice` response.
+///
+/// The pile is fixed and every card in it is going back into the SAME library,
+/// so the player submits one thing: the full arrangement. The response is a
+/// permutation of `pile` whose first `top_count` entries go on top (topmost
+/// first) and whose remaining entries go to the bottom. That single payload
+/// answers both questions CR asks here — which cards take which position
+/// (CR 608.2d, the effect's own choice) and in what order each position's
+/// cards are arranged (CR 401.4) — and is the same full-permutation contract
+/// `WaitingFor::RippleBottomOrder` uses for its own "in any order" pile.
+///
+/// Requiring the whole pile is also what makes the check total: equal length
+/// plus no duplicates plus full membership IS a permutation, so no card can be
+/// silently stranded or placed twice. Mirrors `validate_dig_selection`'s
+/// duplicate / membership checks — this state is one of the freeform
+/// selections the multiplayer server forwards unvalidated, so `apply` is the
+/// sole legality boundary.
+fn validate_dig_rest_split_selection(
+    arrangement: &[ObjectId],
+    pile: &[ObjectId],
+    top_count: usize,
+    scope: DigRestSplitScope,
+) -> Result<(), EngineError> {
+    if arrangement.len() != pile.len() {
+        return Err(EngineError::InvalidAction(format!(
+            "rest-split arrangement must list exactly all {} card(s) of the rest pile, got {}",
+            pile.len(),
+            arrangement.len()
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for id in arrangement {
+        if !seen.insert(*id) {
+            return Err(EngineError::InvalidAction(
+                "rest-split selection contains a duplicate card".to_string(),
+            ));
+        }
+        if !pile.contains(id) {
+            return Err(EngineError::InvalidAction(
+                "rest-split selection contains a card that is not in the rest pile".to_string(),
+            ));
+        }
+    }
+    // CR 401.4 only: the partition was already settled by the chooser, so this
+    // prompt's acting player (the library's owner) may reorder WITHIN each pile
+    // but may not move a card across the top/bottom boundary — that was never
+    // their decision to make. `pile` is stored top-pile-first, so the leading
+    // `top_count` entries of both lists must name the same SET.
+    if !scope.partition_is_open() {
+        let settled_top: std::collections::HashSet<_> =
+            pile[..top_count.min(pile.len())].iter().copied().collect();
+        let submitted_top: std::collections::HashSet<_> = arrangement
+            [..top_count.min(arrangement.len())]
+            .iter()
+            .copied()
+            .collect();
+        if settled_top != submitted_top {
+            return Err(EngineError::InvalidAction(
+                "rest-split arrangement may reorder each pile but may not change which cards \
+                 are on top; the partition was already chosen by another player"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_exact_keep_on_top_selection(
     selection: &[ObjectId],
     looked_at: &[ObjectId],
@@ -1158,6 +1368,28 @@ fn continuation_exiles_found_set(chain: &ResolvedAbility) -> bool {
     false
 }
 
+fn hidden_search_audiences_for_search(
+    state: &GameState,
+    searcher: crate::types::player::PlayerId,
+) -> Vec<crate::types::game_state::HiddenSearchAudience> {
+    state
+        .active_library_searches
+        .get(&searcher)
+        .map(|search| {
+            search
+                .looked_at()
+                .iter()
+                .map(
+                    |(_, _, identity)| crate::types::game_state::HiddenSearchAudience {
+                        identity: *identity,
+                        audience: search.learned_audience().to_vec(),
+                    },
+                )
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Finalize the ordinary (non-partitioned) SearchChoice continuation. This is
 /// the single authority for both the synchronous selection path and a
 /// SearchFound batch resumed after one or more nested replacement pauses.
@@ -1244,8 +1476,12 @@ fn finalize_standard_search_selection(
         propagate_targets_through_search_shuffle(&mut continuation.pending.chain, &targets);
     }
     if has_delivery {
+        let hidden_search_audiences = hidden_search_audiences_for_search(state, player);
         state.pending_library_search_delivery = Some(
-            crate::types::game_state::LibrarySearchDeliveryResume::Standard { searcher: player },
+            crate::types::game_state::LibrarySearchDeliveryResume::Standard {
+                searcher: player,
+                hidden_search_audiences,
+            },
         );
     } else {
         // CR 701.23a + CR 701.24a: no leading found-card movement belongs to
@@ -1325,6 +1561,9 @@ fn apply_search_partition(
                     source_id,
                     resume: crate::types::game_state::LibrarySearchDeliveryResume::Standard {
                         searcher: controller,
+                        hidden_search_audiences: hidden_search_audiences_for_search(
+                            state, controller,
+                        ),
                     },
                 },
             ),
@@ -1771,6 +2010,31 @@ pub(super) fn handle_resolution_choice(
     action: GameAction,
     events: &mut Vec<GameEvent>,
 ) -> Result<ResolutionChoiceOutcome, EngineError> {
+    // CR 601.2h + CR 608.2c: callers that already sit inside the resolution
+    // choice reducer (including legacy/internal tests) must use the same
+    // staged-payment action owner as the public engine boundary. The public
+    // boundary normally intercepts earlier; this guard is the single fallback
+    // for direct resolution-choice dispatch and cannot double-apply because the
+    // descriptor is cleared or extended by `apply_pending_action` itself.
+    if payment_transaction::owns_action(state, &action) {
+        let semantic_owner = waiting_for
+            .acting_players()
+            .first()
+            .copied()
+            .or_else(|| state.payment_transaction.as_ref().map(|tx| tx.owner))
+            .ok_or_else(|| {
+                EngineError::InvalidAction(
+                    "staged payment choice has no semantic owner".to_string(),
+                )
+            })?;
+        let actor = super::turn_control::authorized_submitter_for_player(state, semantic_owner);
+        let result = payment_transaction::apply_pending_action(state, actor, action)?;
+        events.extend(result.events);
+        return Ok(ResolutionChoiceOutcome::ActionResult(
+            ActionResult::applied(std::mem::take(events), result.waiting_for)
+                .with_log_entries(result.log_entries),
+        ));
+    }
     let outcome = match (waiting_for, action) {
         // CR 608.2d: the resolving effect offers only its legal optional payment choices; CR 118.12: choosing a payable branch continues the payment whose success governs the reflexive "If you do" result.
         (
@@ -1894,6 +2158,13 @@ pub(super) fn handle_resolution_choice(
                 scry_bottom_count: Some(bottom_cards.len() as u32),
                 scry_top_count: Some(all_cards.len() as u32 - bottom_cards.len() as u32),
             });
+            // CR 701.22a + CR 701.22d: the scry is complete only once the choice is
+            // made; it is published here, outside any chain window, so record it here.
+            crate::game::effects::record_player_action_this_turn(
+                state,
+                player,
+                crate::types::events::PlayerActionKind::Scry,
+            );
             // CR 401.5 + CR 611.3a: Scry reorders the library top directly (not
             // through the zone-move seam), so a continuous `TopOfLibraryMatches`
             // static must be re-evaluated — self-gated so it's a no-op otherwise.
@@ -2172,10 +2443,12 @@ pub(super) fn handle_resolution_choice(
                             rest_cards: graveyard_cards,
                             rest_destination: Zone::Graveyard,
                             rest_order: DigRestOrder::Preserve,
+                            rest_split_top_count: None,
                             clear_markers: cards.clone(),
                             publish_tracked_set: None,
                             publish_tracked_set_cause: None,
                             emit_reveal_until_resolved: None,
+                            reveal_until_hit_snapshot: None,
                             // The entry paused, so the publish below never
                             // runs — the completion drain publishes instead,
                             // once the entry has completed.
@@ -2412,6 +2685,7 @@ pub(super) fn handle_resolution_choice(
                 enters_attacking,
                 revealed_misses,
                 rest_destination,
+                rest_order,
             },
             GameAction::DecideOptionalEffect { accept },
         ) => {
@@ -2455,11 +2729,13 @@ pub(super) fn handle_resolution_choice(
                                     source_id: Some(source_id),
                                     rest_cards: misses,
                                     rest_destination,
-                                    rest_order: DigRestOrder::Preserve,
+                                    rest_order,
+                                    rest_split_top_count: None,
                                     clear_markers,
                                     publish_tracked_set: None,
                                     publish_tracked_set_cause: None,
                                     emit_reveal_until_resolved: None,
+                                    reveal_until_hit_snapshot: None,
                                     manifested_for_continuation: None,
                                     kept_delivery: Default::default(),
                                     continuation_targets: Vec::new(),
@@ -2481,11 +2757,14 @@ pub(super) fn handle_resolution_choice(
                     // before this prompt) and surface the parked prompt.
                     if let Some(outcome) = route_kept_card_or_defer(
                         state,
-                        hit_card,
-                        accept_zone,
-                        source_id,
-                        &misses,
-                        rest_destination,
+                        RouteKeptCardContext {
+                            hit_card,
+                            destination: accept_zone,
+                            source_id,
+                            misses: &misses,
+                            rest_destination,
+                            rest_order,
+                        },
                         events,
                     ) {
                         return Ok(outcome);
@@ -2498,38 +2777,63 @@ pub(super) fn handle_resolution_choice(
                 // a non-rest graveyard/exile destination.
                 if let Some(outcome) = route_kept_card_or_defer(
                     state,
-                    hit_card,
-                    decline_zone,
-                    source_id,
-                    &misses,
-                    rest_destination,
+                    RouteKeptCardContext {
+                        hit_card,
+                        destination: decline_zone,
+                        source_id,
+                        misses: &misses,
+                        rest_destination,
+                        rest_order,
+                    },
                     events,
                 ) {
                     return Ok(outcome);
                 }
+            }
+            // CR 701.20a + CR 608.2d: If the rest cards are being placed on the bottom
+            // of the library in any order (PlayerChoice) and there are 2 or more cards,
+            // pause for the controller to announce their permutation.
+            let mut clear_markers = misses.clone();
+            clear_markers.push(hit_card);
+            if rest_destination == Zone::Library
+                && rest_order == DigRestOrder::PlayerChoice
+                && misses.len() >= 2
+            {
+                state.waiting_for = WaitingFor::RevealUntilBottomOrder {
+                    player,
+                    source_id,
+                    cards: misses,
+                    clear_markers,
+                    emit_reveal_until_resolved: None,
+                    reveal_until_hit_snapshot: None,
+                };
+                return Ok(ResolutionChoiceOutcome::WaitingFor(
+                    state.waiting_for.clone(),
+                ));
             }
             // CR 701.20a + CR 614.6: move the rest pile (RIP redirects fire) and
             // run the marker clear + continuation drain as the completion. On a
             // synchronous landing the completion runs inline; on a CR 616.1 pause
             // it defers and the drain runs it once the pile lands. `clear_markers`
             // is the misses plus the kept card (already placed above).
-            let mut clear_markers = misses.clone();
-            clear_markers.push(hit_card);
             match effects::reveal_until::move_rest_then(
                 state,
                 &misses,
                 rest_destination,
+                rest_order,
                 Some(crate::types::game_state::BatchCompletion::RevealRestPile {
                     delivery_stage: crate::types::game_state::DigDeliveryStage::Rest,
                     player,
                     source_id: Some(source_id),
                     rest_cards: Vec::new(),
                     rest_destination,
-                    rest_order: DigRestOrder::Preserve,
+                    rest_order,
+                    rest_split_top_count: None,
                     clear_markers,
                     publish_tracked_set: None,
                     publish_tracked_set_cause: None,
                     emit_reveal_until_resolved: None,
+                    reveal_until_hit_snapshot: None,
                     manifested_for_continuation: None,
                     kept_delivery: Default::default(),
                     continuation_targets: Vec::new(),
@@ -2790,6 +3094,58 @@ pub(super) fn handle_resolution_choice(
             effects::ripple::place_on_library_bottom(state, source_id, &order, final_cast, events);
             ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
         }
+        // CR 701.20a + CR 608.2d: the controller announces the bottom-placement
+        // order for cards put on the bottom of the library in any order.
+        // `order` must be a permutation of the offered pile.
+        (
+            WaitingFor::RevealUntilBottomOrder {
+                player,
+                source_id,
+                cards,
+                clear_markers,
+                emit_reveal_until_resolved,
+                reveal_until_hit_snapshot,
+            },
+            GameAction::SelectCards { cards: order },
+        ) => {
+            let _ = player;
+            if order.len() != cards.len()
+                || order.iter().collect::<std::collections::HashSet<_>>().len() != order.len()
+                || !order.iter().all(|id| cards.contains(id))
+            {
+                return Err(EngineError::InvalidAction(
+                    "RevealUntil bottom order must be a permutation of the revealed cards"
+                        .to_string(),
+                ));
+            }
+            let completion = BatchCompletion::RevealRestPile {
+                delivery_stage: crate::types::game_state::DigDeliveryStage::Rest,
+                player,
+                source_id: Some(source_id),
+                rest_cards: Vec::new(),
+                rest_destination: Zone::Library,
+                rest_order: DigRestOrder::Preserve,
+                rest_split_top_count: None,
+                clear_markers,
+                publish_tracked_set: None,
+                publish_tracked_set_cause: None,
+                emit_reveal_until_resolved,
+                reveal_until_hit_snapshot,
+                manifested_for_continuation: None,
+                kept_delivery: Default::default(),
+                continuation_targets: Vec::new(),
+                rest_delivery: Default::default(),
+            };
+            effects::reveal_until::move_rest_then(
+                state,
+                &order,
+                Zone::Library,
+                DigRestOrder::Preserve,
+                Some(completion),
+                events,
+            );
+            ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
+        }
         // CR 608.2g + CR 601.2 + CR 202.3: Invoke Calamity's free-cast window —
         // the controller either picks one candidate to cast for free or declines
         // (`selection: None`) to finish the window. A chosen candidate is cast
@@ -3007,7 +3363,30 @@ pub(super) fn handle_resolution_choice(
                 // correct mana-ability cost axis — a removed-counter count
                 // (CR 122.1) or an announced X for `Pay X speed` (CR 702.179e).
                 match resource {
-                    PayableResource::Counters => pending.chosen_counter_count = Some(amount),
+                    // CR 107.3a + CR 107.3i: for a literal "Remove X counters"
+                    // mana-ability cost (Saltcrusted Steppe class), CR 107.3i
+                    // requires every instance of X on the object to share the
+                    // one announced value, so the announced amount must ALSO
+                    // bind the "Add X mana" quantity ref, or the mana
+                    // production resolves X to 0 despite the counters being
+                    // removed successfully. Only the answered leaf that is
+                    // ITSELF the literal-X sentinel binds `chosen_x` —
+                    // `next_chosen_counter_leaf_is_literal_x` checks the
+                    // specific leaf this answer completes (by its position in
+                    // `chosen_counter_counts`), not just "some Counters prompt
+                    // was answered", so a composite cost combining a literal-X
+                    // leaf with an unrelated literal "any number of" leaf
+                    // (CR 107.1c, e.g. Pentad Prism, which has no `X` in its
+                    // Oracle text) can't leak the wrong leaf's amount into X.
+                    // Each leaf's amount is appended independently rather than
+                    // overwriting a single scalar, so a composite cost with
+                    // more than one chosen-count leaf keeps them distinct.
+                    PayableResource::Counters => {
+                        if mana_abilities::next_chosen_counter_leaf_is_literal_x(state, &pending) {
+                            pending.chosen_x = Some(amount);
+                        }
+                        pending.chosen_counter_counts.push(amount);
+                    }
                     PayableResource::Speed => pending.chosen_x = Some(amount),
                     other => {
                         return Err(EngineError::InvalidAction(format!(
@@ -3924,6 +4303,88 @@ pub(super) fn handle_resolution_choice(
                 ResolutionChoiceOutcome::WaitingFor(finish_with_continuation(state, player, events))
             }
         }
+        // CR 401.2 + CR 401.4 + CR 608.2d + CR 701.20e: The looking player
+        // arranges a Telling Time-class remainder across the top and the
+        // bottom of one library. `arrangement` is a full permutation of the
+        // pile: its first `top_count` entries go on top (topmost first, per
+        // CR 608.2d's effect-level choice) and the remainder goes to the
+        // bottom, each pile in exactly the submitted order (CR 401.4).
+        (
+            WaitingFor::DigRestSplitChoice {
+                player: split_player,
+                library_owner,
+                cards,
+                top_count,
+                bottom_count: _,
+                scope,
+                source_id: split_source_id,
+                completion,
+            },
+            GameAction::SelectCards { cards: arrangement },
+        ) => {
+            validate_dig_rest_split_selection(&arrangement, &cards, top_count, scope)?;
+            // VALIDATE BEFORE MUTATING. `completion` carries the dig's entire
+            // deferred tail — `BatchCompletion::RevealRestPile`'s reveal-marker
+            // cleanup, tracked-set publication, continuation wiring and
+            // priority drain. Running the move without it would place the
+            // cards correctly and then silently drop that whole tail, leaving
+            // stale reveal markers and an unpublished tracked set behind a
+            // dig that looked like it completed.
+            //
+            // `None` is reachable and is never legitimate: `game/visibility.rs`
+            // STRIPS `completion` to `None` in every per-player client
+            // projection, so a `None` here is a redacted client view being
+            // echoed back (or a hand-built/corrupt state), not a real pending
+            // dig. Reject it before a single card moves rather than finishing
+            // the split against bookkeeping that is not there.
+            let Some(completion) = completion else {
+                return Err(EngineError::InvalidAction(
+                    "rest-split state has no pending dig completion to finish; \
+                     refusing to move cards against missing bookkeeping"
+                        .to_string(),
+                ));
+            };
+            // Total: `top_count` was clamped to `cards.len()` at park time and
+            // `arrangement` was just proven to be a permutation of `cards`.
+            let split_at = top_count.min(arrangement.len());
+            // CR 401.4: the chooser has now fixed WHICH cards take each
+            // position, but they are not the owner of these cards, so the
+            // order within any 2+ card pile is still the owner's to choose.
+            // Hand the same pile straight on as an owner-addressed
+            // arrangement prompt, carrying the dig's deferred tail verbatim —
+            // the identical `completion` hand-off `split_rest_pile_or_park`
+            // performs, one prompt later.
+            if scope == DigRestSplitScope::PartitionOnly
+                && (split_at >= 2 || arrangement.len() - split_at >= 2)
+            {
+                debug_assert_ne!(
+                    split_player, library_owner,
+                    "PartitionOnly is only parked when the chooser is not the owner"
+                );
+                state.waiting_for = WaitingFor::new_dig_rest_split(
+                    split_player,
+                    library_owner,
+                    arrangement,
+                    split_at,
+                    DigRestSplitScope::OrderOnly,
+                    split_source_id,
+                    Some(completion),
+                );
+                return Ok(ResolutionChoiceOutcome::WaitingFor(
+                    state.waiting_for.clone(),
+                ));
+            }
+            let (top_cards, bottom_cards) = arrangement.split_at(split_at);
+            route_rest_split_then(
+                state,
+                top_cards,
+                bottom_cards,
+                split_source_id,
+                Some(*completion),
+                events,
+            );
+            ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
+        }
         (
             WaitingFor::DigChoice {
                 player,
@@ -3934,6 +4395,7 @@ pub(super) fn handle_resolution_choice(
                 selectable_cards,
                 kept_destination,
                 rest_destination,
+                rest_split_top_count,
                 rest_order,
                 enter_tapped,
                 enters_attacking,
@@ -3996,6 +4458,14 @@ pub(super) fn handle_resolution_choice(
                         // allow-raw-zone: looked-at cards remain library objects until a keep decision (CR 701.20b/e).
                         player_state.library.insert(index, card_id);
                     }
+                    // CR 401.2: `rest_split_top_count` is deliberately not
+                    // consulted on this branch. It only exists for a remainder
+                    // whose position within the library is still open, and
+                    // this branch is the reorder form (`kept_destination ==
+                    // Some(Library)`) whose text has ALREADY named both
+                    // positions — the kept cards go on top and the remainder
+                    // to the bottom in the same instruction, leaving nothing
+                    // to split. The parser never emits both together.
                     match rest_destination {
                         Some(Zone::Library) => {
                             if rest_order == DigRestOrder::Random {
@@ -4060,10 +4530,12 @@ pub(super) fn handle_resolution_choice(
                                     rest_cards: Vec::new(),
                                     rest_destination: zone,
                                     rest_order: DigRestOrder::Preserve,
+                                    rest_split_top_count: None,
                                     clear_markers: Vec::new(),
                                     publish_tracked_set: None,
                                     publish_tracked_set_cause: None,
                                     emit_reveal_until_resolved: None,
+                                    reveal_until_hit_snapshot: None,
                                     manifested_for_continuation: None,
                                     kept_delivery: Default::default(),
                                     continuation_targets: Vec::new(),
@@ -4141,10 +4613,19 @@ pub(super) fn handle_resolution_choice(
                         },
                         rest_destination: rest_destination.unwrap_or(Zone::Graveyard),
                         rest_order,
+                        // CR 401.2 + CR 701.20e: carry the Telling Time-class
+                        // remainder split onto the kept delivery. The split
+                        // prompt can only be raised once the kept cards have
+                        // finished leaving (the remainder is not fixed until
+                        // then), and this completion is the only carrier that
+                        // survives an arbitrary number of replacement re-parks
+                        // in between.
+                        rest_split_top_count,
                         clear_markers: Vec::new(),
                         publish_tracked_set: Some(publish_set),
                         publish_tracked_set_cause: publish_cause,
                         emit_reveal_until_resolved: None,
+                        reveal_until_hit_snapshot: None,
                         manifested_for_continuation: None,
                         kept_delivery: crate::types::game_state::DigKeptDeliveryOutcome::pending(
                             state,
@@ -4212,10 +4693,12 @@ pub(super) fn handle_resolution_choice(
                     rest_cards: Vec::new(),
                     rest_destination,
                     rest_order,
+                    rest_split_top_count: None,
                     clear_markers: Vec::new(),
                     publish_tracked_set: Some(publish_set),
                     publish_tracked_set_cause: publish_cause,
                     emit_reveal_until_resolved: None,
+                    reveal_until_hit_snapshot: None,
                     manifested_for_continuation: None,
                     kept_delivery: Default::default(),
                     continuation_targets: Vec::new(),
@@ -4225,6 +4708,31 @@ pub(super) fn handle_resolution_choice(
                         rest_destination,
                     ),
                 };
+                // CR 401.2 + CR 701.20e: the same Telling Time-class split the
+                // kept-delivery completion applies, for the reveal-only dig
+                // form whose kept cards never move (`kept_destination: None`)
+                // and so has no kept batch to ride. Same gate, same helper,
+                // same tail.
+                if let Some(top_count) =
+                    rest_split_top_count.filter(|_| rest_destination == Zone::Library)
+                {
+                    return Ok(ResolutionChoiceOutcome::WaitingFor(
+                        match split_rest_pile_or_park(
+                            state,
+                            player,
+                            &ordered_unkept,
+                            top_count,
+                            dig_source_id,
+                            completion,
+                            events,
+                        ) {
+                            crate::game::zone_pipeline::BatchMoveResult::Done
+                            | crate::game::zone_pipeline::BatchMoveResult::NeedsChoice => {
+                                state.waiting_for.clone()
+                            }
+                        },
+                    ));
+                }
                 return Ok(ResolutionChoiceOutcome::WaitingFor(
                     match route_rest_partition_then(
                         state,
@@ -5559,6 +6067,7 @@ pub(super) fn handle_resolution_choice(
                 enters_attacking,
                 owner_library,
                 track_exiled_by_source,
+                face_down_in_exile,
                 face_down_profile,
                 enter_with_counters,
                 conditional_enter_with_counters,
@@ -5901,7 +6410,52 @@ pub(super) fn handle_resolution_choice(
                 ));
             }
 
+            // CR 608.2c: The selected BounceAll is still the producer of the
+            // delayed reader parked directly behind this validated prompt.
+            // Transfer its exact key before a replacement can install a child
+            // frame; a further pause gives the key to that zone iteration.
+            let pending_return_result_producer = state
+                .active_ability_continuation()
+                .and_then(|pending| pending.pending_return_result_producer);
+            if let Some((occurrence_id, result_id)) = pending_return_result_producer {
+                let current = state.active_ability_continuation().is_some_and(|pending| {
+                    matches!(effect_kind, EffectKind::BounceAll)
+                        && pending.chain.source_id == source_id
+                        && pending.return_result_occurrence == Some(occurrence_id)
+                        && crate::types::game_state::reads_return_result_id(
+                            &pending.chain,
+                            result_id,
+                        )
+                });
+                if !current {
+                    return Err(EngineError::InvalidAction(
+                        "Return-result producer does not own this zone choice".to_string(),
+                    ));
+                }
+                if !chosen.is_empty() {
+                    state
+                        .active_ability_continuation_frame_mut()
+                        .expect("validated return-result continuation remains active")
+                        .pending
+                        .pending_return_result_producer = None;
+                }
+            }
+
             if chosen.is_empty() {
+                if let Some((occurrence_id, result_id)) = pending_return_result_producer {
+                    effects::publish_return_result(state, occurrence_id, result_id, Vec::new())
+                        .map_err(|error| EngineError::InvalidAction(error.to_string()))?;
+                    state
+                        .active_ability_continuation_frame_mut()
+                        .expect("validated return-result continuation remains active")
+                        .pending
+                        .pending_return_result_producer = None;
+                }
+                if matches!(effect_kind, EffectKind::ChangeZone)
+                    && destination == Some(Zone::Battlefield)
+                {
+                    effects::settle_empty_forwarded_zone_result(state, source_id);
+                }
                 // Issue #423 audit: no cards chosen — this branch moves no
                 // objects and emits no battlefield-exit events, so no
                 // dies-trigger collection is needed.
@@ -6037,6 +6591,31 @@ pub(super) fn handle_resolution_choice(
                         )
                     })?;
                     let chosen_ids: Vec<_> = chosen.to_vec();
+                    if dest_zone == Zone::Battlefield {
+                        let selected = chosen_ids
+                            .iter()
+                            .filter_map(|id| {
+                                state.objects.get(id).map(
+                                    crate::types::identifiers::ObjectIncarnationRef::from_object,
+                                )
+                            })
+                            .collect();
+                        if let Some(marker) = state
+                            .active_ability_continuation_frame_mut()
+                            .and_then(|frame| {
+                                frame
+                                    .pending
+                                    .chain
+                                    .context
+                                    .pending_forwarded_zone_result
+                                    .as_mut()
+                            })
+                        {
+                            if marker.producer == source_id {
+                                marker.selected = Some(selected);
+                            }
+                        }
+                    }
                     let completion_cause = effects::this_way_cause_for_zone(dest_zone);
                     let tracks_player_action_completion = completion_cause.is_some_and(|cause| {
                         effects::active_player_action_completion_requires(state, source_id, cause)
@@ -6046,6 +6625,22 @@ pub(super) fn handle_resolution_choice(
                             state,
                             &chosen_ids,
                         );
+                    if let Some(marker) =
+                        state
+                            .active_ability_continuation_frame_mut()
+                            .and_then(|frame| {
+                                frame
+                                    .pending
+                                    .chain
+                                    .context
+                                    .pending_forwarded_zone_result
+                                    .as_mut()
+                            })
+                    {
+                        if marker.producer == source_id && marker.selected.is_some() {
+                            marker.group = Some(logical_zone_change_group.logical_group_id);
+                        }
+                    }
                     let logical_group_event_start = events.len();
                     for (i, card_id) in chosen_ids.iter().enumerate() {
                         let origin = state
@@ -6080,6 +6675,7 @@ pub(super) fn handle_resolution_choice(
                             // single-candidate shortcut (issue #4235 review).
                             duration: duration.clone(),
                             track_exiled_by_source,
+                            face_down_in_exile,
                             // CR 708.2a + CR 708.3: thread the face-down profile that
                             // was carried across the `EffectZoneChoice` round-trip into
                             // the move ctx, so a selected face-down `ChangeZone` card
@@ -6100,6 +6696,7 @@ pub(super) fn handle_resolution_choice(
                                 *card_id,
                                 ctx.destination,
                                 ctx.source_id,
+                                ctx.face_down_in_exile,
                             );
                         let delivery_start = events.len();
                         match effects::change_zone::process_one_zone_move_with_terminal(
@@ -6138,6 +6735,7 @@ pub(super) fn handle_resolution_choice(
                                 .expect("paused EffectZoneChoice retains its explicit delivery prefix");
                                 state.push_change_zone_iteration(
                                     crate::types::game_state::PendingChangeZoneIteration {
+                                        pending_return_result_producer,
                                         logical_zone_change_group,
                                         paused_current: anticipated_pause.map(|mut boundary| {
                                             boundary
@@ -6163,6 +6761,7 @@ pub(super) fn handle_resolution_choice(
                                             conditional_enter_with_counters.clone(),
                                         duration: ctx.duration.clone(),
                                         track_exiled_by_source: ctx.track_exiled_by_source,
+                                        face_down_in_exile: ctx.face_down_in_exile,
                                         moved_count: tracks_player_action_completion.then(|| {
                                                 i32::try_from(
                                                     effects::change_zone::count_selected_zone_arrivals(
@@ -6213,6 +6812,7 @@ pub(super) fn handle_resolution_choice(
                                 .expect("paused EffectZoneChoice retains its explicit delivery prefix");
                                 state.push_change_zone_iteration(
                                     crate::types::game_state::PendingChangeZoneIteration {
+                                        pending_return_result_producer,
                                         logical_zone_change_group,
                                         paused_current: Some(
                                             state
@@ -6245,6 +6845,7 @@ pub(super) fn handle_resolution_choice(
                                             conditional_enter_with_counters.clone(),
                                         duration: ctx.duration.clone(),
                                         track_exiled_by_source: ctx.track_exiled_by_source,
+                                        face_down_in_exile: ctx.face_down_in_exile,
                                         moved_count: tracks_player_action_completion.then(|| {
                                                 i32::try_from(
                                                     effects::change_zone::count_selected_zone_arrivals(
@@ -6284,6 +6885,18 @@ pub(super) fn handle_resolution_choice(
                         &mut events[logical_group_event_start..],
                     )
                     .expect("completed EffectZoneChoice owns every terminal member outcome");
+                    if let Some((occurrence_id, result_id)) = pending_return_result_producer {
+                        effects::publish_return_result(
+                            state,
+                            occurrence_id,
+                            result_id,
+                            crate::types::game_state::settled_logical_zone_change_records(
+                                &logical_zone_change_group,
+                            ),
+                        )
+                        .map_err(|error| EngineError::InvalidAction(error.to_string()))?;
+                    }
+                    effects::settle_forwarded_zone_result(state, &logical_zone_change_group);
                 }
                 EffectKind::Tap => {
                     for &card_id in &chosen {
@@ -6574,6 +7187,7 @@ pub(super) fn handle_resolution_choice(
                         // producers) is deliberately not threaded here.
                         duration: None,
                         track_exiled_by_source,
+                        face_down_in_exile,
                         face_down_profile: face_down_profile.clone(),
                         library_placement: None,
                         // CR 614.12: cost-payment exile carries no enter-modifier
@@ -6596,6 +7210,7 @@ pub(super) fn handle_resolution_choice(
                                 *card_id,
                                 ctx.destination,
                                 ctx.source_id,
+                                ctx.face_down_in_exile,
                             );
                         let delivery_start = events.len();
                         match effects::change_zone::process_one_zone_move_with_terminal(
@@ -6621,6 +7236,7 @@ pub(super) fn handle_resolution_choice(
                                 .expect("paused cost-payment zone move retains its explicit delivery prefix");
                                 state.push_change_zone_iteration(
                                     crate::types::game_state::PendingChangeZoneIteration {
+                                        pending_return_result_producer: None,
                                         logical_zone_change_group,
                                         paused_current: anticipated_pause.map(|mut boundary| {
                                             boundary
@@ -6642,6 +7258,7 @@ pub(super) fn handle_resolution_choice(
                                             conditional_enter_with_counters.clone(),
                                         duration: ctx.duration.clone(),
                                         track_exiled_by_source: ctx.track_exiled_by_source,
+                                        face_down_in_exile: ctx.face_down_in_exile,
                                         moved_count: None,
                                         face_down_profile: ctx.face_down_profile.clone(),
                                         library_placement: ctx.library_placement.clone(),
@@ -6670,6 +7287,7 @@ pub(super) fn handle_resolution_choice(
                                 .expect("paused cost-payment zone move retains its explicit delivery prefix");
                                 state.push_change_zone_iteration(
                                     crate::types::game_state::PendingChangeZoneIteration {
+                                        pending_return_result_producer: None,
                                         logical_zone_change_group,
                                         paused_current: Some(
                                             state
@@ -6698,6 +7316,7 @@ pub(super) fn handle_resolution_choice(
                                             conditional_enter_with_counters.clone(),
                                         duration: ctx.duration.clone(),
                                         track_exiled_by_source: ctx.track_exiled_by_source,
+                                        face_down_in_exile: ctx.face_down_in_exile,
                                         moved_count: None,
                                         face_down_profile: ctx.face_down_profile.clone(),
                                         library_placement: ctx.library_placement.clone(),
@@ -8023,11 +8642,10 @@ fn action_result_outcome(
     events: &mut Vec<GameEvent>,
     waiting_for: WaitingFor,
 ) -> ResolutionChoiceOutcome {
-    ResolutionChoiceOutcome::ActionResult(ActionResult {
-        events: std::mem::take(events),
+    ResolutionChoiceOutcome::ActionResult(ActionResult::applied(
+        std::mem::take(events),
         waiting_for,
-        log_entries: vec![],
-    })
+    ))
 }
 
 /// CR 608.2c + CR 603.7: Publish the EffectZoneChoice selection as the chain
@@ -8132,6 +8750,15 @@ fn set_priority(state: &mut GameState, player: crate::types::player::PlayerId) {
     state.priority_player = player;
 }
 
+struct RouteKeptCardContext<'a> {
+    hit_card: ObjectId,
+    destination: Zone,
+    source_id: ObjectId,
+    misses: &'a [ObjectId],
+    rest_destination: Zone,
+    rest_order: DigRestOrder,
+}
+
 /// CR 614.6 + CR 616.1: Move a reveal-until *kept* card to a non-battlefield
 /// destination (`accept_zone` / `decline_zone`) through the zone-change pipeline
 /// so a `Moved` graveyard→exile redirect (Rest in Peace / Leyline of the Void)
@@ -8147,42 +8774,43 @@ fn set_priority(state: &mut GameState, player: crate::types::player::PlayerId) {
 /// path already emitted `EffectResolved` before this prompt.
 fn route_kept_card_or_defer(
     state: &mut GameState,
-    hit_card: ObjectId,
-    destination: Zone,
-    source_id: ObjectId,
-    misses: &[ObjectId],
-    rest_destination: Zone,
+    cx: RouteKeptCardContext<'_>,
     events: &mut Vec<GameEvent>,
 ) -> Option<ResolutionChoiceOutcome> {
     let player = state
         .objects
-        .get(&hit_card)
+        .get(&cx.hit_card)
         .map(|obj| obj.controller)
         .unwrap_or(state.active_player);
-    let mut req =
-        crate::game::zone_pipeline::ZoneMoveRequest::effect(hit_card, destination, source_id);
-    if destination == Zone::Library {
+    let mut req = crate::game::zone_pipeline::ZoneMoveRequest::effect(
+        cx.hit_card,
+        cx.destination,
+        cx.source_id,
+    );
+    if cx.destination == Zone::Library {
         req = req.at_library_position(LibraryPosition::Bottom);
     }
     match crate::game::zone_pipeline::move_object(state, req, events) {
         crate::game::zone_pipeline::ZoneMoveResult::Done => None,
         crate::game::zone_pipeline::ZoneMoveResult::NeedsChoice(_)
         | crate::game::zone_pipeline::ZoneMoveResult::NeedsAuraAttachmentChoice => {
-            let mut clear_markers = misses.to_vec();
-            clear_markers.push(hit_card);
+            let mut clear_markers = cx.misses.to_vec();
+            clear_markers.push(cx.hit_card);
             crate::game::zone_pipeline::defer_completion_on_pause(
                 state,
                 crate::types::game_state::BatchCompletion::RevealRestPile {
                     delivery_stage: crate::types::game_state::DigDeliveryStage::Rest,
                     player,
-                    source_id: Some(source_id),
-                    rest_cards: misses.to_vec(),
-                    rest_destination,
-                    rest_order: DigRestOrder::Preserve,
+                    source_id: Some(cx.source_id),
+                    rest_cards: cx.misses.to_vec(),
+                    rest_destination: cx.rest_destination,
+                    rest_order: cx.rest_order,
+                    rest_split_top_count: None,
                     clear_markers,
                     publish_tracked_set: None,
                     publish_tracked_set_cause: None,
                     emit_reveal_until_resolved: None,
+                    reveal_until_hit_snapshot: None,
                     manifested_for_continuation: None,
                     kept_delivery: Default::default(),
                     continuation_targets: Vec::new(),
@@ -8776,6 +9404,16 @@ pub(crate) fn run_batch_completion(
 ) -> crate::game::zone_pipeline::BatchMoveResult {
     use crate::types::game_state::BatchCompletion;
     match completion {
+        BatchCompletion::RecordInstructionZoneResult {
+            occurrence_id,
+            result_id,
+            settled_records,
+        } => {
+            let records = settled_records.expect("zone result completion must be settled");
+            effects::publish_return_result(state, occurrence_id, result_id, records)
+                .expect("zone result completion publishes once into a live occurrence");
+            crate::game::zone_pipeline::BatchMoveResult::Done
+        }
         BatchCompletion::MilledDeliveryComplete { player_id, cards } => {
             effects::mill::complete_mill_delivery(state, player_id, cards, events)
         }
@@ -9082,10 +9720,12 @@ pub(crate) fn run_batch_completion(
             rest_cards,
             rest_destination,
             rest_order,
+            rest_split_top_count,
             clear_markers,
             publish_tracked_set,
             publish_tracked_set_cause,
             emit_reveal_until_resolved,
+            reveal_until_hit_snapshot,
             manifested_for_continuation,
             kept_delivery,
             continuation_targets,
@@ -9109,10 +9749,12 @@ pub(crate) fn run_batch_completion(
                     rest_cards: Vec::new(),
                     rest_destination,
                     rest_order,
+                    rest_split_top_count: None,
                     clear_markers,
                     publish_tracked_set,
                     publish_tracked_set_cause,
                     emit_reveal_until_resolved,
+                    reveal_until_hit_snapshot: reveal_until_hit_snapshot.clone(),
                     manifested_for_continuation,
                     kept_delivery,
                     continuation_targets,
@@ -9122,6 +9764,37 @@ pub(crate) fn run_batch_completion(
                         rest_destination,
                     ),
                 };
+                // CR 401.2 + CR 701.20e + CR 608.2c: Telling Time-class
+                // remainder. The pile is fixed now that the kept cards have
+                // finished leaving, so its owner partitions it between the top
+                // and the bottom of their library instead of it going
+                // uniformly to `rest_destination`. The Rest-stage completion
+                // built just above IS the dig tail and is handed straight on,
+                // so the split path and the uniform path converge on exactly
+                // the same reveal-marker cleanup, tracked-set publish,
+                // continuation wiring, and priority drain.
+                //
+                // Gated on a Library destination because the split names
+                // positions WITHIN one library (CR 401.2's single face-down
+                // pile has no third position to name); the parser only ever
+                // pairs `rest_split_top_count` with `rest_destination:
+                // Some(Zone::Library)`, and this gate keeps a hand-built or
+                // deserialized state that violates that pairing on the
+                // unchanged uniform route rather than silently relocating the
+                // pile into a library it was not sent to.
+                if let Some(top_count) =
+                    rest_split_top_count.filter(|_| rest_destination == Zone::Library)
+                {
+                    return split_rest_pile_or_park(
+                        state,
+                        player,
+                        &ordered_rest_cards,
+                        top_count,
+                        source_id,
+                        completion,
+                        events,
+                    );
+                }
                 return route_rest_partition_then(
                     state,
                     &ordered_rest_cards,
@@ -9148,10 +9821,12 @@ pub(crate) fn run_batch_completion(
                     rest_cards: Vec::new(),
                     rest_destination,
                     rest_order,
+                    rest_split_top_count: None,
                     clear_markers,
                     publish_tracked_set,
                     publish_tracked_set_cause,
                     emit_reveal_until_resolved,
+                    reveal_until_hit_snapshot: reveal_until_hit_snapshot.clone(),
                     manifested_for_continuation,
                     kept_delivery,
                     continuation_targets,
@@ -9170,6 +9845,23 @@ pub(crate) fn run_batch_completion(
                     events,
                 );
             } else if !rest_cards.is_empty() {
+                // CR 701.20a + CR 608.2d: If the rest cards are being placed on the bottom
+                // of the library in any order (PlayerChoice) and there are 2 or more cards,
+                // pause for the controller to announce their permutation.
+                if rest_destination == Zone::Library
+                    && rest_order == DigRestOrder::PlayerChoice
+                    && rest_cards.len() >= 2
+                {
+                    state.waiting_for = WaitingFor::RevealUntilBottomOrder {
+                        player,
+                        source_id: source_id.unwrap_or(ObjectId(0)),
+                        cards: rest_cards,
+                        clear_markers,
+                        emit_reveal_until_resolved,
+                        reveal_until_hit_snapshot,
+                    };
+                    return zone_pipeline::BatchMoveResult::NeedsChoice;
+                }
                 // CR 701.20a + CR 616.1: Reveal-until rest piles are fully
                 // pipeline-owned, including Library-bottom placement. If a
                 // Library-destination `Moved` replacement pauses here, re-stash
@@ -9181,11 +9873,13 @@ pub(crate) fn run_batch_completion(
                     source_id,
                     rest_cards: Vec::new(),
                     rest_destination,
-                    rest_order: DigRestOrder::Preserve,
+                    rest_order,
+                    rest_split_top_count: None,
                     clear_markers,
                     publish_tracked_set: None,
                     publish_tracked_set_cause: None,
                     emit_reveal_until_resolved,
+                    reveal_until_hit_snapshot: reveal_until_hit_snapshot.clone(),
                     manifested_for_continuation,
                     kept_delivery,
                     continuation_targets,
@@ -9195,6 +9889,7 @@ pub(crate) fn run_batch_completion(
                     state,
                     &rest_cards,
                     rest_destination,
+                    rest_order,
                     Some(cleanup),
                     events,
                 );
@@ -9286,8 +9981,16 @@ pub(crate) fn run_batch_completion(
                 events.push(crate::types::events::GameEvent::EffectResolved {
                     kind: crate::types::ability::EffectKind::RevealUntil,
                     source_id,
-                    subject: None,
+                    subject: reveal_until_hit_snapshot,
                 });
+            }
+            if let Some(snapshot) = effects::parent_referent_context_from_events(state, events) {
+                if let Some(frame) = state.active_ability_continuation_frame_mut() {
+                    frame
+                        .pending
+                        .chain
+                        .set_effect_context_object_recursive(snapshot);
+                }
             }
             // CR 608.2c + CR 701.62a: the paused manifest entry has
             // completed by now — publish its object for the parked consumer,
@@ -9437,7 +10140,14 @@ pub(crate) fn run_batch_completion(
             crate::game::zone_pipeline::BatchMoveResult::Done
         }
         BatchCompletion::LibrarySearchDeliverySettled { resume } => match resume {
-            crate::types::game_state::LibrarySearchDeliveryResume::Standard { searcher } => {
+            crate::types::game_state::LibrarySearchDeliveryResume::Standard {
+                searcher,
+                hidden_search_audiences,
+            } => {
+                state.record_completed_hidden_search_audiences_for_events(
+                    &hidden_search_audiences,
+                    events,
+                );
                 state.active_library_searches.remove(&searcher);
                 state.active_search_decision_controls.remove(&searcher);
                 crate::game::zone_pipeline::BatchMoveResult::Done
@@ -10084,8 +10794,49 @@ mod tests {
             source,
             player,
         );
+        let mut delivery = delivery;
+        delivery.context.face_down_in_exile = crate::types::ability::ExileConcealment::FaceDown;
         state.park_ability_continuation(PendingContinuation::new(Box::new(delivery), &state));
         (state, found)
+    }
+
+    fn multi_card_standard_delivery_state() -> (GameState, ObjectId, ObjectId) {
+        let (mut state, first) = standard_delivery_state();
+        let second = create_object(
+            &mut state,
+            CardId(90_085),
+            PlayerId(0),
+            "Second standard found card".to_string(),
+            Zone::Library,
+        );
+        state.active_library_searches = Default::default();
+        state.active_search_decision_controls = Default::default();
+        let source = state
+            .objects
+            .values()
+            .find(|object| object.name == "Standard search source")
+            .expect("standard search source exists")
+            .id;
+        effects::search_library::resolve(
+            &mut state,
+            &ResolvedAbility::new(
+                Effect::SearchLibrary {
+                    filter: TargetFilter::Any,
+                    count: QuantityExpr::Fixed { value: 2 },
+                    reveal: false,
+                    target_player: None,
+                    selection_constraint: SearchSelectionConstraint::None,
+                    split: None,
+                    source_zones: vec![Zone::Library],
+                },
+                Vec::new(),
+                source,
+                PlayerId(0),
+            ),
+            &mut Vec::new(),
+        )
+        .expect("ordinary two-card SearchLibrary enters its production choice state");
+        (state, first, second)
     }
 
     #[test]
@@ -10117,7 +10868,7 @@ mod tests {
         assert!(state.active_library_searches.get(&PlayerId(0)).is_some());
         assert!(state.pending_library_search_delivery.is_some());
 
-        super::super::engine::apply_as_current(
+        let resumed = super::super::engine::apply_as_current(
             &mut state,
             GameAction::ChooseReplacement { index: 1 },
         )
@@ -10126,6 +10877,112 @@ mod tests {
         assert_eq!(state.objects[&found].zone, Zone::Exile);
         assert!(state.active_library_searches.is_empty());
         assert!(state.pending_library_search_delivery.is_none());
+        let p0 =
+            crate::game::visibility::filter_events_for_viewer(&resumed.events, &state, PlayerId(0));
+        let p1 =
+            crate::game::visibility::filter_events_for_viewer(&resumed.events, &state, PlayerId(1));
+        let spectator =
+            crate::game::visibility::filter_events_for_viewer(&resumed.events, &state, PlayerId(2));
+        let is_hidden_delivery = |event: &GameEvent| {
+            matches!(
+                event,
+                GameEvent::ZoneChanged {
+                    object_id,
+                    from: Some(Zone::Library),
+                    to: Zone::Exile,
+                    record,
+                } if *object_id == found
+                    && record
+                        .trigger_source_context
+                        .as_ref()
+                        .is_some_and(|context| context.face_down)
+            )
+        };
+        assert!(
+            p0.iter().any(is_hidden_delivery),
+            "the search audience must retain the resumed private delivery"
+        );
+        assert!(!p1.iter().any(is_hidden_delivery));
+        assert!(!spectator.iter().any(is_hidden_delivery));
+    }
+
+    #[test]
+    fn paused_multi_card_standard_delivery_filters_each_identity_after_resume() {
+        let (mut state, first, second) = multi_card_standard_delivery_state();
+        let expected_identities = [
+            crate::types::identifiers::ObjectIncarnationRef::from_object(&state.objects[&first]),
+            crate::types::identifiers::ObjectIncarnationRef::from_object(&state.objects[&second]),
+        ];
+        let redirect = install_moved_exile_redirect(&mut state, Zone::Hand, true);
+        state.objects[&redirect].replacement_definitions[0].valid_card =
+            Some(TargetFilter::SpecificObject { id: first });
+
+        super::super::engine::apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: vec![first, second],
+            },
+        )
+        .expect("the two-card SearchChoice must pause for the first replacement");
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ));
+
+        let resumed = super::super::engine::apply_as_current(
+            &mut state,
+            GameAction::ChooseReplacement { index: 1 },
+        )
+        .expect("declining the first-card redirect must resume the complete batch");
+
+        assert_eq!(state.objects[&first].zone, Zone::Exile);
+        assert_eq!(state.objects[&second].zone, Zone::Exile);
+        assert!(!matches!(
+            state.waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ));
+        assert!(state.active_library_searches.is_empty());
+        assert!(state.pending_library_search_delivery.is_none());
+
+        let p0 =
+            crate::game::visibility::filter_events_for_viewer(&resumed.events, &state, PlayerId(0));
+        let p1 =
+            crate::game::visibility::filter_events_for_viewer(&resumed.events, &state, PlayerId(1));
+        let spectator =
+            crate::game::visibility::filter_events_for_viewer(&resumed.events, &state, PlayerId(2));
+        let is_hidden_delivery =
+            |event: &GameEvent, expected: crate::types::identifiers::ObjectIncarnationRef| {
+                matches!(
+                        event,
+                        GameEvent::ZoneChanged {
+                            object_id,
+                            from: Some(Zone::Library),
+                        to: Zone::Exile,
+                        record,
+                    } if *object_id == expected.object_id
+                        && record.trigger_source_context().is_some_and(|context| {
+                            context.face_down && context.identity.reference == expected
+                        })
+                )
+            };
+
+        for expected in expected_identities {
+            assert!(
+                resumed
+                    .events
+                    .iter()
+                    .any(|event| is_hidden_delivery(event, expected)),
+                "the resumed action must carry the hidden delivery for {expected:?}"
+            );
+            assert!(
+                p0.iter().any(|event| is_hidden_delivery(event, expected)),
+                "the search audience must retain the resumed private delivery for {expected:?}"
+            );
+            assert!(!p1.iter().any(|event| is_hidden_delivery(event, expected)));
+            assert!(!spectator
+                .iter()
+                .any(|event| is_hidden_delivery(event, expected)));
+        }
     }
 
     #[test]
@@ -11426,6 +12283,7 @@ mod tests {
                 selectable_cards: vec![black, white],
                 kept_destination: Some(Zone::Library),
                 rest_destination: Some(Zone::Library),
+                rest_split_top_count: None,
                 rest_order: DigRestOrder::Preserve,
                 source_id: None,
                 enter_tapped: false,
@@ -11509,6 +12367,7 @@ mod tests {
                 selectable_cards: vec![keep, rest[0], rest[1], rest[2]],
                 kept_destination: Some(Zone::Library),
                 rest_destination: Some(Zone::Library),
+                rest_split_top_count: None,
                 rest_order: DigRestOrder::Random,
                 source_id: None,
                 enter_tapped: false,
@@ -11549,6 +12408,7 @@ mod tests {
                 selectable_cards: vec![keep, rest[0], rest[1], rest[2]],
                 kept_destination: Some(Zone::Library),
                 rest_destination: Some(Zone::Library),
+                rest_split_top_count: None,
                 rest_order: DigRestOrder::Preserve,
                 source_id: None,
                 enter_tapped: false,
@@ -11881,6 +12741,7 @@ mod tests {
             enters_attacking: false,
             owner_library: false,
             track_exiled_by_source: false,
+            face_down_in_exile: crate::types::ability::ExileConcealment::Public,
             face_down_profile: None,
             enter_with_counters: vec![],
             conditional_enter_with_counters: vec![],

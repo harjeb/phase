@@ -5,7 +5,7 @@ use crate::types::ability::{
     SpellCastingOptionKind, TargetFilter, TypeFilter,
 };
 use crate::types::card_type::{CoreType, Supertype};
-use crate::types::counter::{CounterMatch, CounterType};
+use crate::types::counter::CounterType;
 use crate::types::game_state::{BattlefieldEntryRecord, CastOccurrence, CastingVariant};
 use crate::types::keywords::Keyword;
 use crate::types::mana::{ManaColor, ManaCost};
@@ -648,6 +648,7 @@ pub fn record_zone_change(
     record.recorded_turn_number = state.turn_number;
     record.turn_zone_change_index = turn_zone_change_index;
     state.zone_changes_this_turn.push_back(record.clone());
+    state.record_zone_change_library_knowledge_stamp(record);
 
     if to_zone == Zone::Battlefield {
         record_battlefield_entry(state, object_id);
@@ -888,12 +889,16 @@ pub(crate) fn tap_permanent_for_cost(
 
 /// CR 602.5b: If an activated ability has a restriction on its use (e.g., "Activate only once
 /// each turn"), the restriction continues to apply even if its controller changes.
+///
+/// CR 602.2 + CR 601.2i: `record` is the activation's facts captured before
+/// its cost was paid; it joins the activator's turn journal here.
 pub fn record_ability_activation(
     state: &mut crate::types::game_state::GameState,
     source_id: ObjectId,
     ability_index: usize,
+    record: Option<crate::types::game_state::AbilityActivationRecord>,
 ) {
-    crate::game::ledger::record_ability_activation(state, source_id, ability_index)
+    crate::game::ledger::record_ability_activation(state, source_id, ability_index, record)
         .expect("activated ability must have a valid ledger prefix");
 }
 
@@ -1090,7 +1095,11 @@ fn activation_restriction_applies(
                     gates,
                 )
         }
-        ActivationRestriction::AsInstant => true,
+        // CR 304.5 + CR 605.3a: This printed restriction limits mana activation to priority.
+        ActivationRestriction::AsInstant => {
+            matches!(state.waiting_for, crate::types::WaitingFor::Priority { player: holder } if holder == player)
+                && state.pending_cast.is_none()
+        }
         // CR 702.62a: "If you could begin to cast this card by putting it onto the
         // stack from your hand" — defer to the underlying card type's natural
         // cast timing. Instants activate any time priority is held; sorceries
@@ -1199,15 +1208,14 @@ fn activation_restriction_applies(
             minimum,
             maximum,
         } => {
-            let count: u32 = state
+            // CR 122.1: exact total, compared in u64 so an upper bound is never
+            // satisfied by a count that actually exceeds it.
+            let count = state
                 .objects
                 .get(&source_id)
-                .map(|obj| match counters {
-                    CounterMatch::Any => obj.counters.values().sum(),
-                    CounterMatch::OfType(ct) => obj.counters.get(ct).copied().unwrap_or(0),
-                })
+                .map(|obj| counters.count_in(&obj.counters))
                 .unwrap_or(0);
-            count >= *minimum && maximum.is_none_or(|max| count <= max)
+            crate::game::conditions::counter_count_within_bounds(count, *minimum, *maximum)
         }
     }
 }
@@ -1436,17 +1444,15 @@ pub(crate) fn evaluate_condition(
             let lhs_expr = QuantityExpr::Ref { qty: lhs.clone() };
             let lhs_val =
                 crate::game::quantity::resolve_quantity_scoped(state, &lhs_expr, source_id, player);
-            state
-                .players
-                .iter()
-                .filter(|candidate| candidate.id != player)
-                .all(|candidate| {
+            // CR 102.2 + CR 102.3 + CR 800.4a: each opponent still in the game,
+            // not every other seat (a player who left the game or a teammate is
+            // not an opponent).
+            crate::game::players::opponents(state, player)
+                .into_iter()
+                .all(|opponent| {
                     let rhs_expr = QuantityExpr::Ref { qty: rhs.clone() };
                     let rhs_val = crate::game::quantity::resolve_quantity_scoped(
-                        state,
-                        &rhs_expr,
-                        source_id,
-                        candidate.id,
+                        state, &rhs_expr, source_id, opponent,
                     );
                     comparator.evaluate(lhs_val, rhs_val)
                 })
@@ -1679,7 +1685,8 @@ pub(crate) fn evaluate_condition(
                 .count() as u32
                 >= *count
         }
-        // CR 602.5b: "Activate only if [player condition]" — count matching non-eliminated players.
+        // CR 602.5: "Activate only if [player condition]" — count matching non-eliminated
+        // players (departed ones too for the life-history filters, CR 800.4i).
         ParsedCondition::PlayerCountAtLeast { filter, minimum } => {
             crate::game::quantity::resolve_player_count(
                 state,
@@ -1833,7 +1840,7 @@ fn spell_targets_filter(
         .pending_cast
         .as_ref()
         .filter(|pending| pending.object_id == source_id)
-        .map(|pending| super::ability_utils::flatten_targets_in_chain(&pending.ability))
+        .map(|pending| super::ability_utils::declared_targets_in_chain(&pending.ability))
         .or_else(|| {
             state
                 .stack
@@ -1844,7 +1851,7 @@ fn spell_targets_filter(
                     crate::types::game_state::StackEntryKind::Spell {
                         ability: Some(resolved),
                         ..
-                    } => Some(super::ability_utils::flatten_targets_in_chain(resolved)),
+                    } => Some(super::ability_utils::declared_targets_in_chain(resolved)),
                     _ => None,
                 })
         });
@@ -1914,7 +1921,7 @@ fn spell_cast_targets(
             StackEntryKind::Spell {
                 ability: Some(resolved),
                 ..
-            } => Some(super::ability_utils::flatten_targets_in_chain(resolved)),
+            } => Some(super::ability_utils::declared_targets_in_chain(resolved)),
             _ => None,
         })
         .or_else(|| {
@@ -1931,7 +1938,7 @@ fn spell_cast_targets(
                             StackEntryKind::Spell {
                                 ability: Some(resolved),
                                 ..
-                            } => Some(super::ability_utils::flatten_targets_in_chain(resolved)),
+                            } => Some(super::ability_utils::declared_targets_in_chain(resolved)),
                             _ => None,
                         }),
                     _ => None,
@@ -2009,7 +2016,7 @@ pub(crate) fn target_dependent_flash_permission_satisfied(
     if has_real_flash {
         return true;
     }
-    let targets = super::ability_utils::flatten_targets_in_chain(ability);
+    let targets = super::ability_utils::declared_targets_in_chain(ability);
     let ctx = super::filter::FilterContext::from_source(state, object_id);
     let evaluate_target_filter = |filter: &crate::types::ability::TargetFilter| -> bool {
         targets.iter().any(|t| match t {
@@ -2433,7 +2440,7 @@ pub(crate) fn is_source_blocked(
     // CR 509.1h: "blocked" is the attacker's `blocked` flag, not the presence of
     // blocker assignments — a creature made blocked by an effect (no blockers) is
     // still blocked, and a creature stays blocked even if all its blockers are
-    // removed. Mirrors `unblocked_attackers` / `FilterProp::Unblocked`, which read
+    // removed. Mirrors `combat::attacker_block_status` / `FilterProp::BlockStatus`, which read
     // the same flag.
     state.combat.as_ref().is_some_and(|combat| {
         combat
@@ -2536,7 +2543,7 @@ mod tests {
     #[test]
     fn activation_once_each_turn_uses_shared_counter() {
         let mut state = crate::types::game_state::GameState::new_two_player(42);
-        record_ability_activation(&mut state, ObjectId(10), 1);
+        record_ability_activation(&mut state, ObjectId(10), 1, None);
 
         let result = check_activation_restrictions(
             &state,

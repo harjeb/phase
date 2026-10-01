@@ -52,6 +52,8 @@ use crate::protocol::{PlayerSlotInfo, ServerErrorCode, ServerMessage};
 use crate::reconnect::ReconnectManager;
 use crate::takeback::PendingTakeback;
 
+const TAKEBACK_INTERACTION_SESSION_PREFIX: &str = "rewind-";
+
 /// Bind the engine's interaction authority to a freshly created or restored state.
 ///
 /// Every server-side `GameState` must pass through here. `GameState::new` leaves
@@ -71,9 +73,35 @@ use crate::takeback::PendingTakeback;
 /// Always re-bind on restore rather than trusting an id carried in a persisted blob,
 /// matching how this module re-stamps `hosting` and revokes unentitled debug capability.
 fn bind_interaction_session(state: &mut GameState, game_code: &str) {
-    if let Err(error) =
-        bind_interaction_authority(state, InteractionSessionId(game_code.to_string()))
-    {
+    bind_interaction_session_id(
+        state,
+        InteractionSessionId(game_code.to_string()),
+        game_code,
+    );
+}
+
+/// Rotate the interaction namespace after an approved takeback. The target
+/// snapshot belongs to the abandoned timeline and may carry a rewound serial;
+/// preserving its session id could therefore reissue a capability previously
+/// handed to a client on that discarded branch.
+pub(crate) fn bind_fresh_interaction_session(state: &mut GameState, game_code: &str) {
+    let session = InteractionSessionId(format!(
+        "{TAKEBACK_INTERACTION_SESSION_PREFIX}{:016x}",
+        rand::rng().random::<u64>()
+    ));
+    bind_interaction_session_id(state, session, game_code);
+}
+
+fn is_takeback_interaction_session(session: &InteractionSessionId) -> bool {
+    session.0.starts_with(TAKEBACK_INTERACTION_SESSION_PREFIX)
+}
+
+fn bind_interaction_session_id(
+    state: &mut GameState,
+    session: InteractionSessionId,
+    game_code: &str,
+) {
+    if let Err(error) = bind_interaction_authority(state, session) {
         // Reachable only on decimal-serial exhaustion, so failing the game would be
         // disproportionate — but degrading silently is the very defect this fixes.
         warn!(
@@ -312,6 +340,8 @@ pub struct RestoredStackAutomationResume {
 }
 
 pub const PUBLIC_SEAT_RESERVATION_MS: u64 = 120_000;
+
+pub const HOST_AWAY_REFUSAL: &str = "The host is away; try again when they return";
 
 #[derive(Debug, Clone)]
 pub struct SeatReservation {
@@ -568,6 +598,15 @@ pub struct GameSession {
 impl GameSession {
     pub fn ai_driver_fault(&self) -> Option<&AiDriverFault> {
         self.ai_driver_fault.as_ref()
+    }
+
+    /// A pregame room issues no seat while seat 0 is away.
+    fn reject_if_host_away(&self) -> Result<(), String> {
+        if self.is_pregame() && !self.connected[0] {
+            Err(HOST_AWAY_REFUSAL.to_string())
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn reject_if_ai_driver_faulted(&self) -> Result<(), String> {
@@ -1532,7 +1571,19 @@ impl GameSession {
         // Re-bind rather than trusting any id the blob carries, on the same
         // principle that `restore_session` re-stamps `hosting` and revokes an
         // unentitled debug capability: a persisted blob never drives authority.
-        bind_interaction_session(&mut state, &ps.game_code);
+        // A post-takeback snapshot is marked by the server-owned namespace
+        // prefix. Reusing the ordinary game-code namespace here would reset
+        // generation/serial to the IDs from the abandoned branch, so rotate a
+        // fresh namespace again across the restart boundary.
+        if state
+            .interaction_session_id
+            .as_ref()
+            .is_some_and(is_takeback_interaction_session)
+        {
+            bind_fresh_interaction_session(&mut state, &ps.game_code);
+        } else {
+            bind_interaction_session(&mut state, &ps.game_code);
+        }
 
         let ai_seats: HashSet<PlayerId> = ps.ai_seats.iter().map(|&s| PlayerId(s)).collect();
 
@@ -1953,7 +2004,11 @@ impl GameSession {
                 .map_err(SessionActionError::Rejected)?,
         };
         if let Some(snapshot) = pre_action_state {
-            self.push_takeback_state(player, snapshot);
+            // A reversed activation (CR 602.2b + CR 601.2h) restored the state
+            // from before the action: it is not a takeback point.
+            if result.disposition.is_applied() {
+                self.push_takeback_state(player, snapshot);
+            }
         }
 
         info!(
@@ -2073,7 +2128,9 @@ impl GameSession {
         let applied = submit_interaction_with_rejection(&mut self.state, player, submission)
             .map_err(SessionActionError::Rejected)?;
 
-        if !applied.action.is_actor_scoped_preference() {
+        // A reversed activation (CR 602.2b + CR 601.2h) restored the state from
+        // before the action: it is not a takeback point.
+        if !applied.action.is_actor_scoped_preference() && applied.result.disposition.is_applied() {
             self.push_takeback_state(player, pre_action_state);
         }
 
@@ -2178,6 +2235,7 @@ impl GameSession {
 
     pub fn reserve_seat(&mut self, display_name: String) -> Result<SeatReservation, String> {
         self.reject_if_ai_driver_faulted()?;
+        self.reject_if_host_away()?;
         self.cleanup_expired_reservations();
         if self.game_started {
             return Err("Game has already started".to_string());
@@ -2221,6 +2279,7 @@ impl GameSession {
         display_name: String,
         reservation_token: Option<String>,
     ) -> Result<(String, GameState), String> {
+        self.reject_if_host_away()?;
         self.cleanup_expired_reservations();
         let reservation = match reservation_token.as_deref() {
             Some(token) => Some(
@@ -3073,6 +3132,53 @@ mod tests {
         assert_eq!(restored.key, snapshot.key);
         assert_eq!(restored.mutation_revision, 11);
         assert_eq!(restored.activation_epoch, Some(3));
+    }
+
+    #[test]
+    fn a_pregame_room_issues_no_seat_while_its_host_is_away() {
+        let mut mgr = SessionManager::new();
+        let (code, _host) = mgr.create_game(make_deck(), None);
+        let held = mgr
+            .try_session(&code)
+            .unwrap()
+            .reserve_seat("G".to_string())
+            .expect("reserve while the host is present");
+        let mut session = mgr.try_session(&code).unwrap();
+        session.mark_disconnected(PlayerId(0));
+        let tokens_before = session.player_tokens.clone();
+
+        assert_eq!(
+            session.reserve_seat("H".to_string()).err().as_deref(),
+            Some(HOST_AWAY_REFUSAL)
+        );
+        assert_eq!(
+            session
+                .join_with_reservation(make_deck(), None, String::new(), Some(held.token.clone()))
+                .err()
+                .as_deref(),
+            Some(HOST_AWAY_REFUSAL)
+        );
+        assert_eq!(session.reservations.len(), 1);
+        assert!(session.reservations.contains_key(&held.token));
+        assert_eq!(session.player_tokens, tokens_before);
+
+        session.mark_connected(PlayerId(0));
+        session
+            .join_with_reservation(make_deck(), None, String::new(), Some(held.token))
+            .expect("the held reservation is honoured once the host returns");
+    }
+
+    #[test]
+    fn a_started_game_is_not_refused_as_host_away() {
+        let mut mgr = SessionManager::new();
+        let (code, _host) = mgr.create_game(make_deck(), None);
+        let mut session = mgr.try_session(&code).unwrap();
+        session.mark_disconnected(PlayerId(0));
+        session.game_started = true;
+        assert_eq!(
+            session.reserve_seat("G".to_string()).err().as_deref(),
+            Some("Game has already started")
+        );
     }
 
     #[test]
@@ -4476,6 +4582,130 @@ mod tests {
         assert!(session.pending_takeback.is_none());
     }
 
+    /// CR 602.2b + CR 601.2h: an activation reversed at its cost election is not
+    /// a takeback point. The session's newest takeback entry stays the state
+    /// from before the activation — which the reversal restored — so "undo my
+    /// last action" can never jump back into the dead prompt.
+    #[test]
+    fn a_reversed_activation_records_no_takeback_point() {
+        use engine::types::ability::{
+            AbilityCost, AbilityDefinition, AbilityKind, ControllerRef, QuantityExpr,
+            StaticDefinition, TargetFilter, TypedFilter,
+        };
+        use engine::types::mana::{ManaType, ManaUnit};
+        use engine::types::statics::{ActivationExemption, CostModifyMode, StaticMode};
+
+        let reducer = |amount: u32, minimum_mana: Option<u32>| {
+            StaticDefinition::new(StaticMode::ReduceAbilityCost {
+                mode: CostModifyMode::Reduce,
+                keyword: "activated".to_string(),
+                amount,
+                minimum_mana,
+                dynamic_count: None,
+                exemption: ActivationExemption::None,
+                activator: None,
+                targets: None,
+                frequency: None,
+            })
+            .affected(TargetFilter::Typed(
+                TypedFilter::creature().controller(ControllerRef::You),
+            ))
+        };
+        // −2 (floor two) then −3 on {5} locks {0}; the reverse locks {2}, which
+        // one floating mana cannot pay.
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario
+            .add_creature(P0, "Floored reducer", 1, 1)
+            .with_static_definition(reducer(2, Some(2)));
+        scenario
+            .add_creature(P0, "Unfloored reducer", 1, 1)
+            .with_static_definition(reducer(3, None));
+        let source = scenario
+            .add_creature(P0, "Activator", 2, 2)
+            .with_ability_definition(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::GainLife {
+                        amount: QuantityExpr::Fixed { value: 1 },
+                        player: TargetFilter::Controller,
+                    },
+                )
+                .cost(AbilityCost::Mana {
+                    cost: ManaCost::generic(5),
+                }),
+            )
+            .id();
+        scenario.with_mana_pool(
+            P0,
+            vec![ManaUnit::new(
+                ManaType::Colorless,
+                ObjectId(0),
+                false,
+                vec![],
+            )],
+        );
+        let runner = scenario.build();
+
+        let (mgr, code, token0, _token1) = setup_two_player_game();
+        let mut session = mgr.try_session(&code).unwrap();
+        session.state = runner.state().clone();
+        let ability_index = session.state.objects[&source]
+            .abilities
+            .iter()
+            .position(|a| matches!(a.kind, AbilityKind::Activated))
+            .unwrap();
+
+        session
+            .handle_action(
+                &token0,
+                GameAction::ActivateAbility {
+                    source_id: source,
+                    ability_index,
+                },
+            )
+            .expect("the activation reaches its election");
+        let costly = match &session.state.waiting_for {
+            WaitingFor::OrderCostReductions { outcomes, .. } => {
+                assert_eq!(outcomes.len(), 2, "the order must be observable");
+                outcomes[1].order.clone()
+            }
+            other => panic!("expected the cost election, got {other:?}"),
+        };
+        let depth_at_prompt = session.takeback_history.len();
+        let pre_activation = session
+            .takeback_history
+            .back()
+            .map(|(_, state)| state.clone())
+            .expect("the activation itself is a takeback point");
+
+        session
+            .handle_action(
+                &token0,
+                GameAction::OrderCostReductions {
+                    order: costly,
+                    hybrid_announcement: Vec::new(),
+                },
+            )
+            .expect("a legal election is not an error");
+        assert!(
+            matches!(session.state.waiting_for, WaitingFor::Priority { player } if player == P0),
+            "the unpayable election reversed the activation, got {:?}",
+            session.state.waiting_for
+        );
+        assert!(session.state.stack.is_empty(), "nothing reached the stack");
+        assert_eq!(
+            session.takeback_history.len(),
+            depth_at_prompt,
+            "a reversal must not add a takeback point"
+        );
+        assert_eq!(
+            session.takeback_history.back().map(|(_, state)| state),
+            Some(&pre_activation),
+            "the newest takeback point is still the pre-activation state"
+        );
+    }
+
     /// A takeback restores a live shortcut offer through the same rekeying
     /// boundary as persisted sessions. The old offer capability must not be
     /// usable after the approved rollback.
@@ -4518,6 +4748,158 @@ mod tests {
             },
         )
         .is_err());
+    }
+
+    /// An approved rollback must rotate the interaction namespace as well as
+    /// the precast epoch. Replaying the same action after rollback must mint a
+    /// fresh successor id, so a response captured from the abandoned branch is
+    /// rejected instead of being accepted on the new timeline.
+    #[test]
+    fn approved_takeback_rekeys_all_interaction_capabilities() {
+        let (mgr, code, token0, token1) = started_two_seat_game();
+        let (first_player, first_token, _, first_submission) =
+            live_witness(&mgr, &code, &token0, &token1);
+        let original_session = mgr
+            .try_session(&code)
+            .unwrap()
+            .state
+            .interaction_session_id
+            .clone();
+
+        mgr.try_session(&code)
+            .unwrap()
+            .handle_interaction(first_token, first_submission)
+            .expect("the first live capability must be accepted");
+        let (second_player, second_token, _, stale_submission) =
+            live_witness(&mgr, &code, &token0, &token1);
+        let stale_id = stale_submission.interaction_id.clone();
+        let approving_player = if first_player == P0 { P1 } else { P0 };
+
+        let mut session = mgr.try_session(&code).unwrap();
+        assert_eq!(
+            session.request_takeback(first_player, RewindTarget::LastAction),
+            Ok(TakebackOutcome::Pending)
+        );
+        assert_eq!(
+            session.respond_takeback(approving_player, true),
+            Ok(TakebackOutcome::Approved)
+        );
+        assert_ne!(
+            session.state.interaction_session_id, original_session,
+            "approved takeback must leave the abandoned interaction namespace"
+        );
+        drop(session);
+
+        let (fresh_first_player, fresh_first_token, _, fresh_first_submission) =
+            live_witness(&mgr, &code, &token0, &token1);
+        assert_eq!(
+            fresh_first_player, first_player,
+            "rollback must restore the same semantic first decision"
+        );
+        mgr.try_session(&code)
+            .unwrap()
+            .handle_interaction(fresh_first_token, fresh_first_submission)
+            .expect("the replayed decision must accept its fresh capability");
+
+        let (fresh_second_player, _, _, fresh_second_submission) =
+            live_witness(&mgr, &code, &token0, &token1);
+        assert_eq!(
+            fresh_second_player, second_player,
+            "replaying the decision must reach the same semantic successor"
+        );
+        assert_ne!(
+            fresh_second_submission.interaction_id, stale_id,
+            "the replayed successor must not reuse an abandoned capability id"
+        );
+
+        let stale_error = mgr
+            .try_session(&code)
+            .unwrap()
+            .handle_interaction(second_token, stale_submission)
+            .expect_err("an abandoned-branch capability must be rejected");
+        assert_eq!(stale_error, "That interaction has already changed.");
+        mgr.try_session(&code)
+            .unwrap()
+            .handle_interaction(
+                if fresh_second_player == P0 {
+                    &token0
+                } else {
+                    &token1
+                },
+                fresh_second_submission,
+            )
+            .expect("the fresh successor capability must remain usable");
+    }
+
+    /// A persisted post-takeback state must keep the abandoned branch's
+    /// interaction namespace out of the restart path. Rebinding it to the
+    /// ordinary game code would reset generation/serial and recreate the
+    /// original capability captured before the rollback.
+    #[test]
+    fn persisted_takeback_restore_rekeys_abandoned_interaction_capabilities() {
+        let (mgr, code, token0, token1) = started_two_seat_game();
+        let (first_player, first_token, _, abandoned_submission) =
+            live_witness(&mgr, &code, &token0, &token1);
+        let abandoned_id = abandoned_submission.interaction_id.clone();
+        let approving_player = if first_player == P0 { P1 } else { P0 };
+
+        mgr.try_session(&code)
+            .unwrap()
+            .handle_interaction(first_token, abandoned_submission.clone())
+            .expect("the pre-takeback capability must be accepted once");
+
+        let mut session = mgr.try_session(&code).unwrap();
+        assert_eq!(
+            session.request_takeback(first_player, RewindTarget::LastAction),
+            Ok(TakebackOutcome::Pending)
+        );
+        assert_eq!(
+            session.respond_takeback(approving_player, true),
+            Ok(TakebackOutcome::Approved)
+        );
+        let takeback_session = session.state.interaction_session_id.clone();
+        assert!(
+            takeback_session
+                .as_ref()
+                .is_some_and(is_takeback_interaction_session),
+            "approved takeback must carry the server-owned lineage marker"
+        );
+        let persisted = session.to_persisted();
+        drop(session);
+
+        let db = Arc::new(CardDatabase::default());
+        let mut restored = GameSession::from_persisted(persisted, &db)
+            .expect("a started post-takeback snapshot must restore");
+        assert_ne!(
+            restored.state.interaction_session_id,
+            Some(InteractionSessionId(code.clone())),
+            "a takeback restore must not fall back to the ordinary game-code namespace"
+        );
+        assert_ne!(
+            restored.state.interaction_session_id, takeback_session,
+            "a restart must rotate the takeback namespace again"
+        );
+
+        let stale_error = restored
+            .handle_interaction(first_token, abandoned_submission)
+            .expect_err("the pre-takeback capability must stay stale after restart");
+        assert_eq!(stale_error, "That interaction has already changed.");
+
+        let filtered = filter_state_for_player(&restored.state, first_player);
+        let fresh_submission = match derive_viewer_interaction(
+            &restored.state,
+            &filtered,
+            first_player,
+        )
+        .availability
+        {
+            InteractionAvailability::ProgressAvailable { witness } => witness,
+            other => panic!("restored takeback state must publish a fresh witness, got {other:?}"),
+        };
+        assert_ne!(fresh_submission.interaction_id, abandoned_id);
+        restored
+            .handle_interaction(first_token, fresh_submission)
+            .expect("the fresh post-restart capability must remain usable");
     }
 
     /// Existing server snapshots wrote a raw `GameState` at `state`. That
@@ -7248,6 +7630,7 @@ mod tests {
             selectable_cards: top_three.clone(),
             kept_destination: Some(Zone::Library),
             rest_destination: Some(Zone::Library),
+            rest_split_top_count: None,
             rest_order: engine::types::ability::DigRestOrder::Preserve,
             source_id: None,
             enter_tapped: false,

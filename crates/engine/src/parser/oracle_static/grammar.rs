@@ -793,8 +793,7 @@ pub(crate) fn parse_enchanted_equipped_predicate(
                     // scoped-designation or payment-continuation leaf reaching
                     // THIS path would still be a false green.
                     def.condition = Some(
-                        parse_static_condition(condition_text)
-                            .or_else(|| parse_attached_static_condition(condition_text))
+                        parse_attached_static_condition(condition_text)
                             .map(|condition| gate_cant_untap_condition(condition, condition_text))
                             .unwrap_or_else(|| {
                                 unparsed_gate_condition(
@@ -856,7 +855,8 @@ pub(crate) fn parse_enchanted_equipped_predicate(
     {
         (
             body_tp,
-            super::shared::parse_unless_static_condition(&pred_tp, Some(&affected)),
+            super::shared::parse_unless_static_condition(&pred_tp, Some(&affected))
+                .map(rebind_source_object_quantities_to_recipient),
             condition_tp
                 .original
                 .trim()
@@ -881,7 +881,7 @@ pub(crate) fn parse_enchanted_equipped_predicate(
     };
     let body_lower = body_tp.lower;
 
-    // CR 702.3b (:3915) + CR 508.1c (:2270): "can attack [<class>] as though
+    // CR 702.3b + CR 508.1c: "can attack [<class>] as though
     // <pronoun> didn't have defender" on an attached subject (and on the plural
     // subjects the creatures-you-control prefix handler at line ~620 routes here).
     // Shares ONE recognizer with the non-attached static production, the
@@ -976,7 +976,7 @@ pub(crate) fn parse_enchanted_equipped_predicate(
                 if companions.is_empty() {
                     return Vec::new();
                 }
-                // CR 508.1c (:2270): the printed trailing gate governs EVERY
+                // CR 508.1c: the printed trailing gate governs EVERY
                 // conjunct, not just the first. The recursion above is handed
                 // `companion_pred`, which comes from the body AFTER the trailing
                 // condition was split off — so a companion never sees that gate on
@@ -2218,32 +2218,6 @@ pub(crate) fn parse_alt_cost_rider(input: &str) -> OracleResult<'_, KeywordKind>
         ),
     )
     .parse(input)
-}
-
-/// Inject a `HasKeywordKind` property into a `TargetFilter`. If the filter is already
-/// `Typed`, push into its `properties`. Otherwise wrap with `And` over a new typed
-/// filter carrying only the keyword constraint.
-pub(crate) fn inject_keyword_kind_filter_prop(
-    filter: TargetFilter,
-    kind: KeywordKind,
-) -> TargetFilter {
-    match filter {
-        TargetFilter::Typed(mut tf) => {
-            tf.properties
-                .push(FilterProp::HasKeywordKind { value: kind });
-            TargetFilter::Typed(tf)
-        }
-        other => TargetFilter::And {
-            filters: vec![
-                other,
-                TargetFilter::Typed(TypedFilter {
-                    type_filters: vec![],
-                    controller: None,
-                    properties: vec![FilterProp::HasKeywordKind { value: kind }],
-                }),
-            ],
-        },
-    }
 }
 
 /// CR 601.2f: Classification of a cost-modifier subject against the

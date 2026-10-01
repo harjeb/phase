@@ -886,7 +886,7 @@ pub(crate) fn is_forced_block_static_candidate(lower: &str) -> bool {
 /// `combine_conditions` rather than one replacing the other. All emitted
 /// definitions share the original full-line description, matching the convention
 /// used by other compound handlers (e.g., `CantBeEquipped` + `CantBeEnchanted`).
-/// CR 702.3b (:3915) + CR 509.1b (:2857): the MIRROR of
+/// CR 702.3b + CR 509.1b: the MIRROR of
 /// [`try_split_and_can_attack_despite_defender`] — a defender exception printed
 /// FIRST, with a rules-bearing companion clause after it:
 ///
@@ -939,7 +939,7 @@ pub(crate) fn try_defender_exception_with_companion(text: &str) -> Option<Vec<St
     if let Some(affected) = companion.affected.clone() {
         permission = permission.affected(affected);
     }
-    // CR 508.1c (:2270): the interposed class (if any) and the line's own printed
+    // CR 508.1c: the interposed class (if any) and the line's own printed
     // gate are INDEPENDENT restrictions — same conjoin authority as production (b)
     // and the forward splitter.
     if let Some(condition) =
@@ -960,7 +960,7 @@ pub(crate) fn try_split_and_can_attack_despite_defender(
     // a word — so the tag begins at "and", not at the leading space. We then
     // strip the trailing space of `before` to produce clean Line A text.
     //
-    // CR 702.3b (:3915): the SHARED recognizer, so the interposed class cannot be
+    // CR 702.3b: the SHARED recognizer, so the interposed class cannot be
     // supported on the non-conjunctive shape and misparsed here. NOTE the third
     // binding: base DISCARDED `rest` as `_rest`; the widened form MUST bind it,
     // because the combinator's output type is no longer a `&str` with a length.
@@ -1013,7 +1013,7 @@ pub(crate) fn try_split_and_can_attack_despite_defender(
     if let Some(affected) = template.affected.clone() {
         companion = companion.affected(affected);
     }
-    // CR 508.1c (:2270): the interposed class and Line A's OWN condition are
+    // CR 508.1c: the interposed class and Line A's OWN condition are
     // INDEPENDENT gates and both must hold, so they conjoin rather than one
     // replacing the other. SAME helper and SAME `(Some, Some)` arm as production
     // (b). Guarded by `spire_serpent_conjunctive_split_composes_both_conditions`
@@ -3124,7 +3124,7 @@ pub(crate) fn parse_can_attack_despite_defender(
         None => (*tp, None),
     };
 
-    // CR 702.3b (:3915) + CR 609.4 (:2854): ONE recognizer for this grammar, shared
+    // CR 702.3b + CR 609.4: ONE recognizer for this grammar, shared
     // with the attached-subject arm, the effect-side production, the conjunctive
     // static splitter and the effect-side continuous compound — so the class cannot
     // be supported on one printed shape and misparsed on another.
@@ -3179,7 +3179,7 @@ pub(crate) fn parse_can_attack_despite_defender(
     let mut def = StaticDefinition::new(StaticMode::CanAttackWithDefender)
         .affected(affected)
         .description(description.to_string());
-    // CR 508.1c (:2270): the interposed class and a trailing " as long as " gate are
+    // CR 508.1c: the interposed class and a trailing " as long as " gate are
     // INDEPENDENT restrictions and both must hold, so they compose with `And` rather
     // than one replacing the other. `needs_defending_player_anchor` walks leaves
     // (`any_leaf`), so the compound still defers correctly at creature level.
@@ -3205,7 +3205,7 @@ pub(crate) fn parse_can_attack_despite_defender(
     Some(def)
 }
 
-/// CR 508.1c (:2270): two independent gates on one static conjoin.
+/// CR 508.1c: two independent gates on one static conjoin.
 ///
 /// `pub(super)` so the attached-subject production in `grammar.rs` conjoins
 /// through this one authority rather than growing a second spelling.
@@ -3437,22 +3437,21 @@ pub(crate) fn try_parse_scoped_must_attack_block(
     )
 }
 
-/// CR 611.3a + CR 613.1f: Detect and split
-/// `"PRIMARY and FOREIGN_SUBJECT have/has/gains/gain KEYWORD [as long as COND]"`
-/// (including the inverted form `"As long as COND, PRIMARY and FOREIGN_SUBJECT …"`).
-///
-/// A "foreign subject" is any noun phrase parseable by `parse_continuous_subject_filter`
-/// that does NOT resolve to `SelfRef`. Example: "creatures you control have vigilance"
-/// after "~ gets +2/+2 and" — Angelic Field Marshal's Lieutenant ability.
-///
-/// Returns two `StaticDefinition`s: one for the primary (existing `affected`) plus a
-/// companion `Continuous` def for the foreign-subject keyword grant. Both inherit the
-/// same `StaticCondition` when present so the gate applies to both effects.
-///
-/// CR 109.5 + CR 611.3a: the condition binds each effect independently (CR 611.3a),
-/// but MTG print convention always states one condition for the whole clause, so both
-/// defs receive the same condition object.
-pub(crate) fn try_split_and_foreign_keyword_grant(text: &str) -> Option<Vec<StaticDefinition>> {
+/// CR 611.3a + CR 613.1f + CR 613.4c: Split
+/// `"PRIMARY and FOREIGN_SUBJECT <predicate> [as long as COND]"` (and the inverted
+/// `"As long as COND, …"` form) into the primary's static(s) plus one `Continuous`
+/// companion scoped to FOREIGN_SUBJECT — any subject `parse_continuous_subject_filter`
+/// resolves to something other than `SelfRef`. The predicate is a keyword grant
+/// ("~ gets +2/+2 and creatures you control have vigilance") or a characteristic
+/// modification ("~ gets +2/+2 and other creatures you control get +2/+2 and have
+/// trample"). Both halves are gated on the clause's condition.
+pub(crate) fn try_split_and_foreign_subject_grant(text: &str) -> Option<Vec<StaticDefinition>> {
+    #[derive(Clone, Copy)]
+    enum ForeignPredicate {
+        KeywordGrant,
+        Modification,
+    }
+
     let lower = text.to_lowercase();
     let tp = TextPair::new(text, &lower);
 
@@ -3475,9 +3474,15 @@ pub(crate) fn try_split_and_foreign_keyword_grant(text: &str) -> Option<Vec<Stat
 
     let effect_lower = effect_original.to_lowercase();
 
-    // Scan for "and FOREIGN_SUBJECT verb KEYWORD" in the effect text.
-    // We try each grant verb and check every " and " position.
-    for verb in [" have ", " has ", " gains ", " gain "] {
+    // Scan for "and FOREIGN_SUBJECT <verb> <predicate>" in the effect text.
+    for (verb, predicate_kind) in [
+        (" have ", ForeignPredicate::KeywordGrant),
+        (" has ", ForeignPredicate::KeywordGrant),
+        (" gains ", ForeignPredicate::KeywordGrant),
+        (" gain ", ForeignPredicate::KeywordGrant),
+        (" get ", ForeignPredicate::Modification),
+        (" gets ", ForeignPredicate::Modification),
+    ] {
         let mut search_lower = effect_lower.as_str();
         let mut search_offset = 0;
         while let Some((before_and, subject_lower, keyword_lower)) =
@@ -3507,7 +3512,7 @@ pub(crate) fn try_split_and_foreign_keyword_grant(text: &str) -> Option<Vec<Stat
                 }
             };
 
-            // Keyword text is everything after the verb.
+            // Predicate text is everything after the verb.
             let kw_start = effect_lower.len() - keyword_lower.len();
             if kw_start >= effect_original.len() {
                 search_offset = and_pos + "and ".len();
@@ -3521,11 +3526,23 @@ pub(crate) fn try_split_and_foreign_keyword_grant(text: &str) -> Option<Vec<Stat
                 continue;
             }
 
-            // Parse keyword list into companion modifications.
-            let mut companion_mods = Vec::new();
-            for part in split_keyword_list(keyword_text) {
-                push_grant_clause_modifications(&mut companion_mods, part.as_ref(), None);
-            }
+            let companion_mods = match predicate_kind {
+                ForeignPredicate::KeywordGrant => {
+                    let mut companion_mods = Vec::new();
+                    for part in split_keyword_list(keyword_text) {
+                        push_grant_clause_modifications(&mut companion_mods, part.as_ref(), None);
+                    }
+                    companion_mods
+                }
+                ForeignPredicate::Modification => {
+                    let predicate_start = kw_start - verb.trim_start().len();
+                    parse_continuous_modifications(
+                        effect_original[predicate_start..]
+                            .trim()
+                            .trim_end_matches('.'),
+                    )
+                }
+            };
             if companion_mods.is_empty() {
                 search_offset = and_pos + "and ".len();
                 search_lower = &effect_lower[search_offset..];
@@ -3548,7 +3565,13 @@ pub(crate) fn try_split_and_foreign_keyword_grant(text: &str) -> Option<Vec<Stat
                 format!("{primary_text}.")
             };
             let mut primary_defs = parse_static_line_multi(&primary_full);
-            if primary_defs.is_empty() {
+            // Also decline when the primary re-parses to a `Continuous` def with no
+            // modifications (e.g. "Insects" of "Insects and Spiders you control get …").
+            if primary_defs.is_empty()
+                || primary_defs.iter().any(|def| {
+                    matches!(def.mode, StaticMode::Continuous) && def.modifications.is_empty()
+                })
+            {
                 search_offset = and_pos + "and ".len();
                 search_lower = &effect_lower[search_offset..];
                 continue;
