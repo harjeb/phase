@@ -13501,65 +13501,6 @@ fn parse_exile_head_actor(input: &str) -> OracleResult<'_, LibraryInstructionAct
     Ok((input, actor))
 }
 
-/// CR 121.1 + CR 614.6: "that player exiles that card instead" (Uba Mask) —
-/// at the head of a draw replacement, "that card" is the card the player would
-/// have drawn, i.e. the top card of the drawing player's own library. The
-/// generic effect parser has no replaced draw in scope and lowers the anaphor
-/// to `ChangeZone { target: ParentTarget }`, which names no object once the
-/// continuation runs (the draw never happened, so nothing was put anywhere).
-/// Rewrite it to exile the drawing player's top library card. Only the chain
-/// head is rewritten: a later link's "that card" refers to whatever an earlier
-/// link produced (Zur's Weirding reveals first).
-///
-/// CR 608.2c: the generic effect parser drops the clause's subject, so the
-/// acting player is read here from the head's own text: "that player" / "they"
-/// is the drawing player (whose library it is); "you" or a bare imperative is
-/// the replacement's controller. An unrecognized subject is left unrewritten
-/// (fail closed).
-fn rewrite_exile_would_be_drawn_card_to_exile_top(def: &mut AbilityDefinition, text: &str) {
-    if !matches!(
-        def.effect.as_ref(),
-        Effect::ChangeZone {
-            origin: None | Some(Zone::Library),
-            destination: Zone::Exile,
-            target: TargetFilter::ParentTarget,
-            ..
-        }
-    ) {
-        return;
-    }
-    let Some(actor) = nom_parse_lower(&text.to_lowercase(), parse_exile_head_actor) else {
-        return;
-    };
-    *def.effect = Effect::ExileTop {
-        player: TargetFilter::PostReplacementDamageTarget,
-        count: QuantityExpr::Fixed { value: 1 },
-        position: LibraryPosition::Top,
-        // CR 406.3: exiled cards are face up by default ("exiles that card
-        // face up").
-        face_down: false,
-        actor,
-    };
-}
-
-/// CR 608.2c: the subject of a draw-replacement "exile(s) …" head, as the
-/// player who performs the exile. "that player" / "they" name the replaced
-/// draw's affected player — the player whose library the card comes from;
-/// "you" or no subject (an imperative) names the controller.
-fn parse_exile_head_actor(input: &str) -> OracleResult<'_, LibraryInstructionActor> {
-    let (input, actor) = alt((
-        value(
-            LibraryInstructionActor::LibraryPlayer,
-            alt((tag("that player "), tag("they "))),
-        ),
-        value(LibraryInstructionActor::Controller, tag("you ")),
-        value(LibraryInstructionActor::Controller, peek(tag("exile"))),
-    ))
-    .parse(input)?;
-    let (input, _) = alt((tag("exiles "), tag("exile "))).parse(input)?;
-    Ok((input, actor))
-}
-
 /// CR 614.6 + CR 701.20a: "they reveal it" in a draw replacement reveals the top
 /// card of the *drawing player's* library, not the enchantment controller's.
 fn rewrite_reveal_top_player_to_post_replacement_target(def: &mut AbilityDefinition) {

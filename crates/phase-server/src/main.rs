@@ -12281,19 +12281,17 @@ async fn handle_client_message(
         | ClientMessage::EndTournament { .. }
         | ClientMessage::RenewTournamentCredential { .. } => {
             let mut conn = identity.to_conn_state();
-            let outbounds = {
-                let mut broker = lobby.lock().await;
-                handle_durable_tournament(
-                    &mut broker,
-                    &mut conn,
-                    to_lobby_client_message(&client_msg).expect("tournament projection"),
-                    game_db,
-                )
-            };
+            let mut broker = lobby.lock().await;
+            let outbounds = handle_durable_tournament(
+                &mut broker,
+                &mut conn,
+                to_lobby_client_message(&client_msg).expect("tournament projection"),
+                game_db,
+            );
             match outbounds {
                 Ok(outbounds) => {
                     identity.absorb_conn_state(conn);
-                    apply_outbounds(outbounds, tx, lobby_subscribers, player_count).await;
+                    apply_outbounds(&broker, outbounds, tx, lobby_subscribers, player_count).await;
                 }
                 Err(reason) => {
                     let request_id = to_lobby_client_message(&client_msg)
